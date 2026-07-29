@@ -1577,8 +1577,8 @@ pub(crate) fn resolved_effort(
         .and_then(|s| {
             s.config_selections
                 .iter()
-                .find(|(k, _)| k.as_str() == EFFORT_CONFIG_KEY)
-                .map(|(_, v)| v.as_str().to_owned())
+                .find(|(key, _)| key.as_str() == EFFORT_CONFIG_KEY)
+                .map(|(_, value)| value.as_str().to_owned())
         })
         .or_else(|| config.thought_level.clone())
         .filter(|value| !value.is_empty())
