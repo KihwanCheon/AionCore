@@ -180,9 +180,46 @@ fn flatten_select_options(options: &SessionConfigSelectOptions) -> Vec<&SessionC
 }
 
 fn decode_config_options(value: &Value) -> Option<Vec<SessionConfigOption>> {
-    serde_json::from_value(value.clone())
+    let normalized = normalize_partial_select_options(value.clone());
+    serde_json::from_value(normalized.clone())
         .ok()
-        .or_else(|| serde_json::from_value(keys_to_camel_case(value.clone())).ok())
+        .or_else(|| serde_json::from_value(keys_to_camel_case(normalized)).ok())
+}
+
+fn normalize_partial_select_options(value: Value) -> Value {
+    let Value::Array(options) = value else {
+        return value;
+    };
+    Value::Array(options.into_iter().map(normalize_partial_select_option).collect())
+}
+
+fn normalize_partial_select_option(value: Value) -> Value {
+    let Value::Object(mut option) = value else {
+        return value;
+    };
+    if option.get("type").and_then(Value::as_str) != Some("select") {
+        return Value::Object(option);
+    }
+
+    if !option.get("name").is_some_and(Value::is_string) {
+        let fallback = match option.get("category").and_then(Value::as_str) {
+            Some("mode") => "Mode".to_owned(),
+            Some("model") => "Model".to_owned(),
+            Some("thought_level") => "Thinking".to_owned(),
+            _ => option.get("id").and_then(Value::as_str).unwrap_or("Option").to_owned(),
+        };
+        option.insert("name".to_owned(), Value::String(fallback));
+    }
+
+    let current_key = if option.contains_key("current_value") {
+        "current_value"
+    } else {
+        "currentValue"
+    };
+    if !option.get(current_key).is_some_and(Value::is_string) {
+        option.insert(current_key.to_owned(), Value::String(String::new()));
+    }
+    Value::Object(option)
 }
 
 fn mode_state_to_snake_value(modes: &SessionModeState) -> Option<Value> {
@@ -544,6 +581,49 @@ mod tests {
                 .current_mode_id
                 .to_string(),
             "plan"
+        );
+    }
+
+    #[test]
+    fn decodes_partial_selects_without_a_session_default() {
+        let options = json!([{
+            "id": "reasoning_effort",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": null,
+            "options": [{ "value": "high", "name": "high" }],
+        }]);
+
+        let decoded = extract_config_options_from_value(&options).expect("partial select catalog");
+        let SessionConfigKind::Select(select) = &decoded[0].kind else {
+            panic!("expected a select option");
+        };
+        assert_eq!(select.current_value.to_string(), "");
+    }
+
+    #[test]
+    fn partial_catalog_merge_preserves_the_thought_level_axis() {
+        let existing = json!([{
+            "id": "reasoning_effort",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": null,
+            "options": [{ "value": "high", "name": "high" }],
+        }]);
+        let incoming = json!([{
+            "id": "mode",
+            "name": "Mode",
+            "category": "mode",
+            "type": "select",
+            "currentValue": "plan",
+            "options": [{ "value": "plan", "name": "Plan" }],
+        }]);
+
+        let merged = merge_config_option_values(Some(&existing), &incoming).expect("catalog merge");
+        assert!(
+            merged
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["category"] == "thought_level"))
         );
     }
 
