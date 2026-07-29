@@ -24,8 +24,8 @@ use aionui_api_types::{
     SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, SearchMessagesQuery,
-    SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ReloadConversationMcpServersRequest,
+    SearchMessagesQuery, SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
@@ -40,11 +40,14 @@ use aionui_db::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, MessageRowUpdate, MessageSearchRow, PersistedSessionState,
     SaveRuntimeStateParams, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, UpdateAgentAvailabilitySnapshotParams, UpsertAssistantDefinitionParams,
-    UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams,
-    init_database_memory,
+    SqliteAssistantPreferenceRepository, SqliteMcpServerRepository, UpdateAgentAvailabilitySnapshotParams,
+    UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams, UpsertAssistantPreferenceParams,
+    UpsertConversationAssistantSnapshotParams, init_database_memory,
 };
-use aionui_db::{MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult};
+use aionui_db::{
+    CreateMcpServerParams, IMcpServerRepository, MessagePageCursor, MessagePageDirection, MessagePageParams,
+    MessagePageResult,
+};
 use aionui_extension::{AssistantRuleDispatcher, ExtensionError};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
@@ -2638,6 +2641,218 @@ async fn update_not_found() {
     let req: UpdateConversationRequest = serde_json::from_value(json!({ "name": "x" })).unwrap();
     let err = svc.update("user_1", "non-existent", req, &task_mgr).await.unwrap_err();
     assert!(matches!(err, ConversationError::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_preserves_ambient_snapshot_while_recycling_runtime() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let original_extra: serde_json::Value =
+        serde_json::from_str(&repo.get("user_1", &conv.id).await.unwrap().unwrap().extra).unwrap();
+    broadcaster.take_events();
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let updated = svc
+        .reload_mcp_servers(
+            "user_1",
+            &conv.id,
+            ReloadConversationMcpServersRequest {
+                sync_aionui_catalog: false,
+                mcp_server_ids: None,
+                session_mcp_servers: vec![],
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+
+    let stored_after: serde_json::Value =
+        serde_json::from_str(&repo.get("user_1", &conv.id).await.unwrap().unwrap().extra).unwrap();
+    assert_eq!(stored_after, original_extra);
+    assert_eq!(updated.extra["mcp_server_ids"], original_extra["mcp_server_ids"]);
+    assert_eq!(updated.extra["mcp_servers"], original_extra["mcp_servers"]);
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::RuntimeCapabilityChanged))]
+    );
+    assert!(broadcaster.take_events().is_empty());
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_replaces_stale_snapshot_and_recycles_idle_runtime() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let workspace = ensure_test_workspace_path();
+    let conv = svc
+        .create(
+            "user_1",
+            serde_json::from_value(json!({
+                "type": "acp",
+                "extra": {
+                    "workspace": workspace,
+                    "backend": "claude",
+                    "selected_mcp_server_ids": []
+                }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    broadcaster.take_events();
+
+    let database = init_database_memory().await.unwrap();
+    sqlx::query(
+        "INSERT INTO users (id, user_type, username, password_hash, status, session_generation, created_at, updated_at) \
+         VALUES ('user_1', 'local', 'user_1', 'hash', 'active', 0, 1, 1)",
+    )
+    .execute(database.pool())
+    .await
+    .unwrap();
+    let mcp_repo = Arc::new(SqliteMcpServerRepository::new(database.pool().clone()));
+    let unity = mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: "user_1",
+            name: "unityMCP",
+            description: None,
+            enabled: true,
+            transport_type: "http",
+            transport_config: r#"{"url":"http://localhost:8080/mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+    mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: "user_1",
+            name: "other-enabled-mcp",
+            description: None,
+            enabled: true,
+            transport_type: "http",
+            transport_config: r#"{"url":"http://localhost:8081/mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+    mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: "user_1",
+            name: "disabled-mcp",
+            description: None,
+            enabled: false,
+            transport_type: "http",
+            transport_config: r#"{"url":"http://localhost:9999/mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+    svc.with_mcp_server_repo(mcp_repo);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id))));
+
+    let req: ReloadConversationMcpServersRequest = serde_json::from_value(json!({
+        "sync_aionui_catalog": true,
+        "mcp_server_ids": [unity.id],
+        "session_mcp_servers": [{
+            "id": "builtin-image",
+            "name": "image-gen",
+            "transport": {
+                "type": "stdio",
+                "command": "image-server",
+                "args": [],
+                "env": {}
+            }
+        }]
+    }))
+    .unwrap();
+    let updated = svc
+        .reload_mcp_servers(
+            "user_1",
+            &conv.id,
+            req,
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.extra["mcp_server_ids"], json!([unity.id]));
+    assert_eq!(updated.extra["mcp_servers"], json!(["unityMCP", "image-gen"]));
+    assert_eq!(updated.extra["session_mcp_servers"][0]["name"], json!("image-gen"));
+    assert_eq!(
+        task_mgr.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::RuntimeCapabilityChanged))]
+    );
+    let events = broadcaster.take_events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].data["action"], "updated");
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_rejects_running_conversation_without_mutation() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let original_extra = repo.get("user_1", &conv.id).await.unwrap().unwrap().extra;
+    task_mgr.insert_agent(
+        &conv.id,
+        AgentInstance::Mock(Arc::new(BlockingCancelAgent::new(&conv.id))),
+    );
+
+    let err = svc
+        .reload_mcp_servers(
+            "user_1",
+            &conv.id,
+            ReloadConversationMcpServersRequest {
+                sync_aionui_catalog: false,
+                mcp_server_ids: None,
+                session_mcp_servers: vec![],
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ConversationError::Busy { .. }));
+    assert_eq!(
+        repo.get("user_1", &conv.id).await.unwrap().unwrap().extra,
+        original_extra
+    );
+    assert_eq!(task_mgr.kill_count(), 0);
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_rejects_starting_turn_without_mutation() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let original_extra = repo.get("user_1", &conv.id).await.unwrap().unwrap().extra;
+    let _turn_claim = svc.runtime_state().try_claim_turn(&conv.id, "starting-turn").unwrap();
+
+    let err = svc
+        .reload_mcp_servers(
+            "user_1",
+            &conv.id,
+            ReloadConversationMcpServersRequest {
+                sync_aionui_catalog: false,
+                mcp_server_ids: None,
+                session_mcp_servers: vec![],
+            },
+            &(task_mgr.clone() as Arc<dyn IWorkerTaskManager>),
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ConversationError::Busy { .. }));
+    assert_eq!(
+        repo.get("user_1", &conv.id).await.unwrap().unwrap().extra,
+        original_extra
+    );
+    assert_eq!(task_mgr.kill_count(), 0);
 }
 
 // ── Delete tests ───────────────────────────────────────────────────
