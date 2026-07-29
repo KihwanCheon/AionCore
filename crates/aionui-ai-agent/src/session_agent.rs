@@ -3331,7 +3331,10 @@ fn spawn_event_pump(
             // Finish, so the translated frame below would be shouted into an empty
             // room. Broadcasting straight from the pump (session-scoped, still alive)
             // is what turns claude's indicator on without waiting for a reload.
-            if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&env.event)) {
+            if let (Some(bus), true) = (
+                broadcaster.as_ref(),
+                informative_usage(&env.event).is_some() || claude_rate_limit_info(&env.event).is_some(),
+            ) {
                 broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
             }
             for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
@@ -3540,6 +3543,18 @@ async fn persist_side_effects(
     if let Some(usage) = informative_usage(event) {
         persist_context_usage(repo, user_id, conversation_id, usage).await;
     }
+    if let Some(rate_limit) = claude_rate_limit_info(event) {
+        persist_claude_rate_limit(repo, user_id, conversation_id, rate_limit).await;
+    }
+}
+
+fn claude_rate_limit_info(event: &SessionEvent) -> Option<&serde_json::Value> {
+    match event {
+        SessionEvent::AdapterSpecific { tag, payload } if tag == "rate_limit_event" => {
+            payload.get("rate_limit_info").filter(|info| info.is_object())
+        }
+        _ => None,
+    }
 }
 
 /// The single gate on whether a usage report says anything about context
@@ -3675,17 +3690,62 @@ async fn persist_context_usage(
     // the GET /usage snapshot exactly as it does off a live frame. Merged like
     // `size`/`cost`: only replaced when the incoming turn actually reported one.
     if !breakdown.is_empty() {
-        usage.insert(
-            "_meta".into(),
-            serde_json::json!({
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cached_read_tokens": breakdown.cached_read_tokens,
-                "cached_write_tokens": breakdown.cached_write_tokens,
-                "thought_tokens": breakdown.thought_tokens,
-            }),
-        );
+        let meta = usage.entry("_meta").or_insert_with(|| serde_json::json!({}));
+        if !meta.is_object() {
+            *meta = serde_json::json!({});
+        }
+        if let Some(meta) = meta.as_object_mut() {
+            meta.insert("input_tokens".into(), serde_json::json!(input_tokens));
+            meta.insert("output_tokens".into(), serde_json::json!(output_tokens));
+            meta.insert(
+                "cached_read_tokens".into(),
+                serde_json::json!(breakdown.cached_read_tokens),
+            );
+            meta.insert(
+                "cached_write_tokens".into(),
+                serde_json::json!(breakdown.cached_write_tokens),
+            );
+            meta.insert("thought_tokens".into(), serde_json::json!(breakdown.thought_tokens));
+        }
     }
+    save_context_usage(repo, user_id, conversation_id, &usage).await;
+}
+
+async fn persist_claude_rate_limit(
+    repo: &dyn IAcpSessionRepository,
+    user_id: &str,
+    conversation_id: &str,
+    rate_limit: &serde_json::Value,
+) {
+    let mut usage = match repo.load_runtime_state_for_user(user_id, conversation_id).await {
+        Ok(Some(state)) => state
+            .context_usage_json
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default(),
+        Ok(None) => serde_json::Map::new(),
+        Err(err) => {
+            tracing::warn!(conversation_id, error = %err, "session-sync: load_runtime_state failed; skipping rate-limit persist");
+            return;
+        }
+    };
+    let meta = usage.entry("_meta").or_insert_with(|| serde_json::json!({}));
+    if !meta.is_object() {
+        *meta = serde_json::json!({});
+    }
+    if let Some(meta) = meta.as_object_mut() {
+        meta.insert("_claude/rateLimit".into(), rate_limit.clone());
+    }
+    save_context_usage(repo, user_id, conversation_id, &usage).await;
+}
+
+async fn save_context_usage(
+    repo: &dyn IAcpSessionRepository,
+    user_id: &str,
+    conversation_id: &str,
+    usage: &serde_json::Map<String, serde_json::Value>,
+) {
     let json = match serde_json::to_string(&usage) {
         Ok(j) => j,
         Err(err) => {
@@ -4468,6 +4528,18 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
             usage["output_tokens"] = serde_json::json!(output_tokens);
             vec![AgentStreamEvent::AcpContextUsage(usage)]
         }
+        // Claude direct-CLI rate-limit events use the same metadata contract as
+        // the official claude-agent-acp adapter. The frontend already consumes this
+        // envelope for the titlebar subscription-usage indicator.
+        SessionEvent::AdapterSpecific { tag, payload } if tag == "rate_limit_event" => payload
+            .get("rate_limit_info")
+            .filter(|info| info.is_object())
+            .map(|info| {
+                vec![AgentStreamEvent::AcpContextUsage(serde_json::json!({
+                    "_meta": { "_claude/rateLimit": info },
+                }))]
+            })
+            .unwrap_or_default(),
         // Nothing HERE, because this function is stateless: the current-value highlight
         // lives in the runtime's overrides, so all `translate_event` could build is a
         // mode-only frame — and the frontend REPLACES its whole snapshot on
@@ -5706,6 +5778,33 @@ mod translate_tests {
         );
     }
 
+    #[test]
+    fn claude_rate_limit_surfaces_as_context_usage_metadata() {
+        let rate_limit = serde_json::json!({
+            "status": "allowed",
+            "resetsAt": 1_785_308_400_u64,
+            "rateLimitType": "seven_day",
+            "utilization": 0.64,
+        });
+        let events = translate_event(
+            SessionEvent::AdapterSpecific {
+                tag: "rate_limit_event".into(),
+                payload: serde_json::json!({
+                    "type": "rate_limit_event",
+                    "rate_limit_info": rate_limit.clone(),
+                }),
+            },
+            "conv-1",
+            false,
+        );
+
+        assert_eq!(events.len(), 1);
+        let crate::protocol::events::AgentStreamEvent::AcpContextUsage(value) = &events[0] else {
+            panic!("expected AcpContextUsage, got {:?}", events[0]);
+        };
+        assert_eq!(value.pointer("/_meta/_claude~1rateLimit"), Some(&rate_limit));
+    }
+
     // A backend Notice (a rejected mode/model/effort set, or a codex out-of-turn
     // warning/deprecation) must NOT be silently dropped at the seam — the backends emit
     // it precisely so the failure is visible. It surfaces as a `Tips` frame the frontend
@@ -6217,6 +6316,48 @@ mod persist_tests {
             "a zero-token turn must not overwrite real occupancy"
         );
         assert_eq!(stored["size"], 1_000_000);
+    }
+
+    #[tokio::test]
+    async fn rate_limit_metadata_survives_a_following_usage_update() {
+        let (repo, _db) = seeded_repo().await;
+        let rate_limit = serde_json::json!({
+            "status": "allowed",
+            "rateLimitType": "five_hour",
+            "utilization": 0.64,
+        });
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &SessionEvent::AdapterSpecific {
+                tag: "rate_limit_event".into(),
+                payload: serde_json::json!({ "rate_limit_info": rate_limit.clone() }),
+            },
+        )
+        .await;
+        persist_side_effects(
+            repo.as_ref(),
+            "user-1",
+            "conv-1",
+            &SessionEvent::UsageDelta {
+                input_tokens: 10,
+                output_tokens: 5,
+                total_tokens: 42,
+                cost_usd: None,
+                context_window: Some(1_000),
+                breakdown: aionui_session::UsageBreakdown {
+                    cached_read_tokens: 3,
+                    cached_write_tokens: 2,
+                    thought_tokens: 1,
+                },
+            },
+        )
+        .await;
+
+        let stored = stored_usage(repo.as_ref()).await;
+        assert_eq!(stored.pointer("/_meta/_claude~1rateLimit"), Some(&rate_limit));
+        assert_eq!(stored["_meta"]["thought_tokens"], 1);
     }
 
     /// The live frame must match what the renderer actually switches on.
