@@ -1,3 +1,5 @@
+mod mcp_reload;
+
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;

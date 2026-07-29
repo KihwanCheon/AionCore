@@ -150,6 +150,24 @@ pub struct UpdateConversationRequest {
     pub extra: Option<serde_json::Value>,
 }
 
+/// Body for `PUT /api/conversations/:id/mcp-servers`.
+///
+/// By default only the in-memory runtime is recycled, preserving whether the
+/// conversation uses ambient/global MCP configuration. Callers may explicitly
+/// request an AionUi catalog snapshot replacement.
+#[derive(Debug, Deserialize)]
+pub struct ReloadConversationMcpServersRequest {
+    #[serde(default)]
+    pub sync_aionui_catalog: bool,
+    /// Explicit AionUi-managed MCP server selection. `None` keeps the
+    /// compatibility behavior of selecting every enabled catalog server,
+    /// while `Some([])` clears the user-managed selection.
+    #[serde(default)]
+    pub mcp_server_ids: Option<Vec<String>>,
+    #[serde(default)]
+    pub session_mcp_servers: Vec<crate::SessionMcpServer>,
+}
+
 /// Body for `POST /api/conversations/clone`.
 ///
 /// Despite the name, this endpoint no longer supports cloning from an

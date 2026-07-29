@@ -2,12 +2,16 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{AgentError, IWorkerTaskManager};
 use aionui_api_types::{
-    CreateConversationRequest, ListConversationsQuery, UpdateConversationRequest, WebSocketMessage,
+    CreateConversationRequest, ListConversationsQuery, ReloadConversationMcpServersRequest, UpdateConversationRequest,
+    WebSocketMessage,
 };
 use aionui_common::{AgentKillReason, AgentType, ConversationSource, ConversationStatus, TimestampMs};
 use aionui_conversation::skill_resolver::SkillResolver;
 use aionui_conversation::{ConversationError, ConversationService};
-use aionui_db::{SqliteConversationRepository, init_database_memory};
+use aionui_db::{
+    CreateMcpServerParams, IMcpServerRepository, SqliteConversationRepository, SqliteMcpServerRepository,
+    init_database_memory,
+};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use std::sync::Mutex;
@@ -118,6 +122,131 @@ fn make_create_req() -> CreateConversationRequest {
         "extra": { "workspace": workspace }
     }))
     .unwrap()
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_preserves_existing_snapshot_for_ambient_configuration() {
+    let (svc, _, task_mgr) = setup().await;
+    let conversation = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let updated = svc
+        .reload_mcp_servers(
+            USER_ID,
+            &conversation.id,
+            ReloadConversationMcpServersRequest {
+                sync_aionui_catalog: false,
+                mcp_server_ids: None,
+                session_mcp_servers: vec![],
+            },
+            &task_mgr,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.id, conversation.id);
+    assert_eq!(updated.extra, conversation.extra);
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_syncs_current_aionui_catalog() {
+    let (svc, _, task_mgr) = setup().await;
+    let conversation = svc.create(USER_ID, make_create_req()).await.unwrap();
+    let mcp_db = init_database_memory().await.unwrap();
+    let mcp_repo = Arc::new(SqliteMcpServerRepository::new(mcp_db.pool().clone()));
+    let unity = mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: USER_ID,
+            name: "unityMCP",
+            description: None,
+            enabled: true,
+            transport_type: "http",
+            transport_config: r#"{"url":"http://localhost:8080/mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+    svc.with_mcp_server_repo(mcp_repo);
+
+    let updated = svc
+        .reload_mcp_servers(
+            USER_ID,
+            &conversation.id,
+            ReloadConversationMcpServersRequest {
+                sync_aionui_catalog: true,
+                mcp_server_ids: None,
+                session_mcp_servers: vec![],
+            },
+            &task_mgr,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.extra["mcp_server_ids"], json!([unity.id]));
+    assert_eq!(updated.extra["mcp_servers"], json!(["unityMCP"]));
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_can_clear_the_explicit_selection() {
+    let (svc, _, task_mgr) = setup().await;
+    let conversation = svc.create(USER_ID, make_create_req()).await.unwrap();
+    let mcp_db = init_database_memory().await.unwrap();
+    let mcp_repo = Arc::new(SqliteMcpServerRepository::new(mcp_db.pool().clone()));
+    mcp_repo
+        .create(CreateMcpServerParams {
+            user_id: USER_ID,
+            name: "unityMCP",
+            description: None,
+            enabled: true,
+            transport_type: "http",
+            transport_config: r#"{"url":"http://localhost:8080/mcp"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+    svc.with_mcp_server_repo(mcp_repo);
+
+    let updated = svc
+        .reload_mcp_servers(
+            USER_ID,
+            &conversation.id,
+            ReloadConversationMcpServersRequest {
+                sync_aionui_catalog: true,
+                mcp_server_ids: Some(vec![]),
+                session_mcp_servers: vec![],
+            },
+            &task_mgr,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(updated.extra["mcp_server_ids"], json!([]));
+    assert_eq!(updated.extra["mcp_servers"], json!([]));
+}
+
+#[tokio::test]
+async fn reload_mcp_servers_hides_other_users_conversation() {
+    let (svc, _, task_mgr) = setup().await;
+    let conversation = svc.create(USER_ID, make_create_req()).await.unwrap();
+
+    let err = svc
+        .reload_mcp_servers(
+            "another-user",
+            &conversation.id,
+            ReloadConversationMcpServersRequest {
+                sync_aionui_catalog: false,
+                mcp_server_ids: None,
+                session_mcp_servers: vec![],
+            },
+            &task_mgr,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, ConversationError::NotFound { .. }));
 }
 
 // ── T1: Create conversation ────────────────────────────────────────

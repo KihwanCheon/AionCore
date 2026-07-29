@@ -4,15 +4,16 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
+    ReloadConversationMcpServersRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -118,6 +119,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
+        .route("/api/conversations/{id}/mcp-servers", put(reload_mcp_servers))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
         .route("/api/conversations/{id}/associated", get(associated))
@@ -201,6 +203,21 @@ async fn update(
     let conversation = state
         .service
         .update(&user.id, &id, req, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(conversation)))
+}
+
+async fn reload_mcp_servers(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ReloadConversationMcpServersRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ConversationResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let conversation = state
+        .service
+        .reload_mcp_servers(&user.id, &id, req, &state.task_manager)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(conversation)))
