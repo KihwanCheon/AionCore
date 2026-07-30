@@ -100,3 +100,7 @@ clean:
 # Decode dev config and copy to clipboard when possible
 cat-config:
     @{{cat_config_script}}
+
+# Fork-only push: run read-only non-test gates and skip the full test suite
+push-fork *ARGS: migration-check lint fmt-check
+    git push {{ARGS}}

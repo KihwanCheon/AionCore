@@ -264,3 +264,11 @@ cargo test -p aionui-<crate1> -p aionui-<crate2>                               #
 ```bash
 just push                                             # full pre-push gate, then push
 ```
+
+## 개인 fork 푸시 예외
+
+- `origin/main`은 개인 fork 브랜치이므로 전체 테스트가 필수는 아니다.
+- 사용자가 푸시를 요청하면 앞선 `just push` 규칙 대신 `just push-fork`를 사용한다.
+- rebase 이후에는 `--force-with-lease`를 반드시 사용한다.
+- upstream PR, 릴리스 또는 사용자가 전체 검증을 요청한 경우에는 기존 `just push`를 사용한다.
+- 테스트를 생략한 경우 최종 보고에 명시한다.
