@@ -43,6 +43,7 @@ use aionui_session_message::targets::MentionableTargets;
 use aionui_shell::ShellRouterState;
 use aionui_sidebar::{ArchiveTeardownPorts, SidebarRouterState, SidebarService};
 use aionui_skill_runtime::{SkillRuntimeRouterState, SkillRuntimeService};
+use aionui_system::external_launch::ExternalLaunchRouterState;
 use aionui_system::{
     ClientPrefService, ConnectionTestRouterState, ConnectionTestService, FeedbackDiagnosticsService, ModelFetchService,
     ProtocolDetectionService, ProviderService, RuntimePrepareService, SettingsService, SystemRouterState,
@@ -55,6 +56,7 @@ use aionui_team::{
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
+use crate::router::external_launch::build_external_launch_state;
 use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
 use crate::services::AppServices;
@@ -129,6 +131,7 @@ impl std::error::Error for RouterBuildError {
 /// tests to override individual modules.
 pub struct ModuleStates {
     pub system: SystemRouterState,
+    pub external_launch: ExternalLaunchRouterState,
     pub conversation: ConversationRouterState,
     pub remote_agent: RemoteAgentRouterState,
     pub agent: AgentRouterState,
@@ -299,6 +302,7 @@ pub async fn build_module_states(
     );
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
+        external_launch: build_module_state_phase(&boot, "external_launch", || build_external_launch_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
             build_conversation_state(
                 services,

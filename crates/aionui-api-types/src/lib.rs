@@ -18,6 +18,7 @@ mod conversation;
 mod cron;
 mod custom_agent;
 mod extension;
+mod external_conversation_launch;
 mod file;
 mod lifecycle;
 mod mcp;
@@ -117,6 +118,12 @@ pub use extension::{
     DisableExtensionRequest, EnableExtensionRequest, ExtensionSummaryResponse, GetI18nRequest, GetPermissionsRequest,
     GetRiskLevelRequest, HubExtensionListItem, HubExtensionListResponse, HubOperationResponse, HubUpdateInfo,
     InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
+};
+pub use external_conversation_launch::{
+    ClaimExternalConversationLaunchRequest, ClaimExternalConversationLaunchResponse,
+    CompleteExternalConversationLaunchRequest, CompleteExternalConversationLaunchResponse,
+    CreateExternalConversationLaunchResponse, ExternalConversationLaunchCallbackStatus,
+    ExternalConversationLaunchPayload, ExternalConversationLaunchRequest,
 };
 pub use file::{
     ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,

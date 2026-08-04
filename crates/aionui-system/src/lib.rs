@@ -5,6 +5,7 @@ pub mod bedrock_probe;
 pub mod client_pref;
 pub mod diagnostics;
 pub mod error;
+pub mod external_launch;
 pub mod keep_awake;
 pub mod model_fetcher;
 pub mod protocol;

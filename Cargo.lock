@@ -995,7 +995,10 @@ dependencies = [
  "aws-config",
  "aws-sdk-bedrock",
  "axum",
+ "chrono",
+ "dashmap",
  "dirs",
+ "getrandom 0.2.17",
  "http-body-util",
  "reqwest",
  "semver",
@@ -1007,6 +1010,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
  "windows-sys 0.61.2",
  "wiremock",
 ]

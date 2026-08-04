@@ -37,6 +37,7 @@ use aionui_project::project_routes;
 use aionui_realtime::{NoopMessageRouter, WebSocketManager, WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_sidebar::sidebar_routes;
+use aionui_system::external_launch::{external_launch_internal_routes, external_launch_routes};
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
 
@@ -274,6 +275,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         })),
     };
 
+    let external_launch_state = states.external_launch.clone();
+    let external_launch_authenticated = external_launch_routes(external_launch_state.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // System routes protected by auth middleware
     let system_authenticated =
         system_routes(states.system).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -391,6 +396,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(antigravity_hook)
         .route("/health", get(health_check))
         .merge(auth_routes(auth_state))
+        .merge(external_launch_authenticated)
         .merge(system_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)
@@ -426,6 +432,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         ))
     }
     .merge(ws_routes)
+    .merge(external_launch_internal_routes(external_launch_state))
     .merge(runtime_team_tools)
     .merge(session_message_runtime)
     .merge(office_proxy)
