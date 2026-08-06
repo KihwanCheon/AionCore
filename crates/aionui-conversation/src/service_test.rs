@@ -20,8 +20,8 @@ use aionui_ai_agent::{
 
 use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
-    ConversationResponse, GetConfigOptionsResponse, GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload,
-    SetConfigOptionRequest, SetConfigOptionResponse,
+    ConversationResponse, ConversationRuntimeConfigSource, GetConfigOptionsResponse, GetModelInfoResponse,
+    ModelInfoEntry, ModelInfoPayload, SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ReloadConversationMcpServersRequest,
@@ -1350,6 +1350,26 @@ fn make_service_with_mock_task_manager(
         repo.clone(),
         agent_metadata_repo,
         Arc::new(StubAcpSessionRepo::default()),
+    );
+    (svc, broadcaster, repo)
+}
+
+fn make_service_with_mock_task_manager_and_runtime_state(
+    task_mgr: Arc<MockTaskManager>,
+    runtime_state: PersistedSessionState,
+) -> (ConversationService, Arc<MockBroadcaster>, Arc<MockRepo>) {
+    let repo = Arc::new(MockRepo::new());
+    let broadcaster = Arc::new(MockBroadcaster::new());
+    let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> = Arc::new(StubAgentMetadataRepo);
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    let svc = ConversationService::new(
+        std::env::temp_dir(),
+        broadcaster.clone(),
+        Arc::new(FixedSkillResolver { names: vec![] }),
+        task_mgr_dyn,
+        repo.clone(),
+        agent_metadata_repo,
+        Arc::new(StubAcpSessionRepo::with_runtime_state(runtime_state)),
     );
     (svc, broadcaster, repo)
 }
@@ -3246,6 +3266,8 @@ struct MockAgent {
     mode: Mutex<String>,
     model_id: Mutex<String>,
     config_options: Arc<Mutex<Vec<AcpConfigOptionDto>>>,
+    get_config_options_delay: Option<Duration>,
+    fail_get_config_options: bool,
     set_config_option_calls: Arc<Mutex<Vec<(String, String)>>>,
     set_config_option_error: Arc<Mutex<Option<AgentError>>>,
     set_config_option_response: Arc<Mutex<Option<SetConfigOptionResponse>>>,
@@ -3285,6 +3307,8 @@ impl MockAgent {
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
             config_options: Arc::new(Mutex::new(Vec::new())),
+            get_config_options_delay: None,
+            fail_get_config_options: false,
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
@@ -3304,6 +3328,8 @@ impl MockAgent {
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
             config_options: Arc::new(Mutex::new(Vec::new())),
+            get_config_options_delay: None,
+            fail_get_config_options: false,
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
@@ -3323,6 +3349,8 @@ impl MockAgent {
             mode: Mutex::new("default".to_owned()),
             model_id: Mutex::new("model-a".to_owned()),
             config_options: Arc::new(Mutex::new(Vec::new())),
+            get_config_options_delay: None,
+            fail_get_config_options: false,
             set_config_option_calls: Arc::new(Mutex::new(Vec::new())),
             set_config_option_error: Arc::new(Mutex::new(None)),
             set_config_option_response: Arc::new(Mutex::new(None)),
@@ -3335,6 +3363,16 @@ impl MockAgent {
 
     fn with_config_options(self, options: Vec<AcpConfigOptionDto>) -> Self {
         *self.config_options.lock().unwrap() = options;
+        self
+    }
+
+    fn with_get_config_options_failure(mut self) -> Self {
+        self.fail_get_config_options = true;
+        self
+    }
+
+    fn with_get_config_options_delay(mut self, delay: Duration) -> Self {
+        self.get_config_options_delay = Some(delay);
         self
     }
 
@@ -3439,6 +3477,12 @@ impl IMockAgent for MockAgent {
     }
 
     async fn get_config_options(&self) -> Result<GetConfigOptionsResponse, AgentError> {
+        if let Some(delay) = self.get_config_options_delay {
+            tokio::time::sleep(delay).await;
+        }
+        if self.fail_get_config_options {
+            return Err(AgentError::Acp(AcpError::NotConnected));
+        }
         Ok(GetConfigOptionsResponse {
             config_options: self.config_options.lock().unwrap().clone(),
         })
@@ -4715,6 +4759,121 @@ async fn get_config_options_returns_active_agent_snapshot() {
 
     assert_eq!(result.config_options[0].id, "model");
     assert_eq!(result.config_options[0].current_value.as_deref(), Some("gpt-5.5"));
+}
+
+#[tokio::test]
+async fn get_runtime_config_prefers_active_values_over_persisted_snapshot() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let runtime_state = PersistedSessionState {
+        current_model_id: Some("snapshot-model".to_owned()),
+        config_selections_json: Some(r#"{"effort":"low"}"#.to_owned()),
+        ..Default::default()
+    };
+    let (svc, _broadcaster, _repo) =
+        make_service_with_mock_task_manager_and_runtime_state(task_mgr.clone(), runtime_state);
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = MockAgent::new(&conv.id).with_config_options(vec![
+        AcpConfigOptionDto {
+            id: "model".to_owned(),
+            name: Some("Model".to_owned()),
+            label: None,
+            description: None,
+            category: Some("model".to_owned()),
+            option_type: "select".to_owned(),
+            current_value: Some("runtime-model".to_owned()),
+            options: Vec::new(),
+        },
+        AcpConfigOptionDto {
+            id: "reasoning_effort".to_owned(),
+            name: Some("Reasoning Effort".to_owned()),
+            label: None,
+            description: None,
+            category: Some("thought_level".to_owned()),
+            option_type: "select".to_owned(),
+            current_value: Some("xhigh".to_owned()),
+            options: Vec::new(),
+        },
+    ]);
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(Arc::new(agent)));
+
+    let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
+
+    assert_eq!(result.model.value.as_deref(), Some("runtime-model"));
+    assert_eq!(result.thought_level.value.as_deref(), Some("xhigh"));
+    assert!(result.has_active_runtime);
+    assert_eq!(result.model.source, ConversationRuntimeConfigSource::Runtime);
+    assert_eq!(result.thought_level.source, ConversationRuntimeConfigSource::Runtime);
+}
+
+#[tokio::test]
+async fn get_runtime_config_falls_back_to_snapshot_when_active_query_fails() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let runtime_state = PersistedSessionState {
+        current_model_id: Some("snapshot-model".to_owned()),
+        config_selections_json: Some(r#"{"reasoning_effort":"high"}"#.to_owned()),
+        ..Default::default()
+    };
+    let (svc, _broadcaster, _repo) =
+        make_service_with_mock_task_manager_and_runtime_state(task_mgr.clone(), runtime_state);
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(
+        &conv.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&conv.id).with_get_config_options_failure())),
+    );
+
+    let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
+
+    assert_eq!(result.model.value.as_deref(), Some("snapshot-model"));
+    assert_eq!(result.thought_level.value.as_deref(), Some("high"));
+    assert!(result.has_active_runtime);
+    assert_eq!(result.model.source, ConversationRuntimeConfigSource::Snapshot);
+    assert_eq!(result.thought_level.source, ConversationRuntimeConfigSource::Snapshot);
+}
+
+#[tokio::test(start_paused = true)]
+async fn get_runtime_config_falls_back_when_active_query_times_out() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let runtime_state = PersistedSessionState {
+        current_model_id: Some("snapshot-model".to_owned()),
+        config_selections_json: Some(r#"{"effort":"xhigh"}"#.to_owned()),
+        ..Default::default()
+    };
+    let (svc, _broadcaster, _repo) =
+        make_service_with_mock_task_manager_and_runtime_state(task_mgr.clone(), runtime_state);
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(
+        &conv.id,
+        AgentInstance::Mock(Arc::new(
+            MockAgent::new(&conv.id).with_get_config_options_delay(Duration::from_secs(30)),
+        )),
+    );
+
+    let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
+
+    assert_eq!(result.model.value.as_deref(), Some("snapshot-model"));
+    assert_eq!(result.thought_level.value.as_deref(), Some("xhigh"));
+    assert_eq!(result.model.source, ConversationRuntimeConfigSource::Snapshot);
+    assert_eq!(result.thought_level.source, ConversationRuntimeConfigSource::Snapshot);
+}
+
+#[tokio::test]
+async fn get_runtime_config_uses_snapshot_without_starting_runtime() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let runtime_state = PersistedSessionState {
+        current_model_id: Some("snapshot-model".to_owned()),
+        config_selections_json: Some(r#"{"thought_level":"medium"}"#.to_owned()),
+        ..Default::default()
+    };
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager_and_runtime_state(task_mgr, runtime_state);
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+
+    let result = svc.get_runtime_config("user_1", &conv.id).await.unwrap();
+
+    assert_eq!(result.model.value.as_deref(), Some("snapshot-model"));
+    assert_eq!(result.thought_level.value.as_deref(), Some("medium"));
+    assert!(!result.has_active_runtime);
+    assert_eq!(result.model.source, ConversationRuntimeConfigSource::Snapshot);
+    assert_eq!(result.thought_level.source, ConversationRuntimeConfigSource::Snapshot);
 }
 
 #[tokio::test]

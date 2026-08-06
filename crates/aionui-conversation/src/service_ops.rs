@@ -9,10 +9,12 @@
 
 use std::collections::HashMap;
 use std::path::Component;
+use std::time::Duration;
 
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_api_types::{
-    ConfigOptionConfirmation, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
+    AcpConfigOptionDto, ConfigOptionConfirmation, ConversationRuntimeConfigResponse, ConversationRuntimeConfigSource,
+    ConversationRuntimeConfigValue, GetConfigOptionsResponse, SetConfigOptionRequest, SetConfigOptionResponse,
     SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_common::{AgentKillReason, ErrorChain};
@@ -23,6 +25,47 @@ use crate::ConversationError;
 use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 
 const MAX_DIR_DEPTH: usize = 10;
+const RUNTIME_CONFIG_READ_TIMEOUT: Duration = Duration::from_secs(1);
+const THOUGHT_LEVEL_IDS: [&str; 3] = ["effort", "reasoning_effort", "thought_level"];
+
+fn non_empty_value(value: Option<&str>) -> Option<String> {
+    value.filter(|value| !value.trim().is_empty()).map(ToOwned::to_owned)
+}
+
+fn runtime_option_value(options: &[AcpConfigOptionDto], category: &str, fallback_ids: &[&str]) -> Option<String> {
+    options
+        .iter()
+        .filter(|option| option.category.as_deref() == Some(category))
+        .find_map(|option| non_empty_value(option.current_value.as_deref()))
+        .or_else(|| {
+            options
+                .iter()
+                .filter(|option| fallback_ids.contains(&option.id.as_str()))
+                .find_map(|option| non_empty_value(option.current_value.as_deref()))
+        })
+}
+
+fn resolved_config_value(
+    runtime_value: Option<String>,
+    snapshot_value: Option<String>,
+) -> ConversationRuntimeConfigValue {
+    if let Some(value) = runtime_value {
+        ConversationRuntimeConfigValue {
+            value: Some(value),
+            source: ConversationRuntimeConfigSource::Runtime,
+        }
+    } else if let Some(value) = snapshot_value {
+        ConversationRuntimeConfigValue {
+            value: Some(value),
+            source: ConversationRuntimeConfigSource::Snapshot,
+        }
+    } else {
+        ConversationRuntimeConfigValue {
+            value: None,
+            source: ConversationRuntimeConfigSource::Unavailable,
+        }
+    }
+}
 
 impl ConversationService {
     // ── Config Options ──────────────────────────────────────────────
@@ -145,6 +188,112 @@ impl ConversationService {
         )
         .await?;
         Ok(())
+    }
+
+    /// Resolve the current model and reasoning effort without starting a new
+    /// agent process. Active runtime values win; missing or failed runtime
+    /// values fall back to the durable ACP session snapshot and then the
+    /// conversation's creation snapshot for legacy rows.
+    pub async fn get_runtime_config(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<ConversationRuntimeConfigResponse, ConversationError> {
+        let row = self
+            .conversation_repo()
+            .get(user_id, conversation_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+
+        let active_agent = self.task_manager().get_task(conversation_id);
+        let has_active_runtime = active_agent.is_some();
+        let runtime_options = if let Some(agent) = active_agent {
+            match tokio::time::timeout(RUNTIME_CONFIG_READ_TIMEOUT, agent.get_config_options()).await {
+                Ok(Ok(response)) => response.config_options,
+                Ok(Err(err)) => {
+                    warn!(
+                        conversation_id,
+                        error = %ErrorChain(&err),
+                        "Failed to read active runtime config; using persisted snapshot",
+                    );
+                    Vec::new()
+                }
+                Err(_) => {
+                    warn!(
+                        conversation_id,
+                        timeout_ms = RUNTIME_CONFIG_READ_TIMEOUT.as_millis(),
+                        "Timed out reading active runtime config; using persisted snapshot",
+                    );
+                    Vec::new()
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
+        let runtime_model = runtime_option_value(&runtime_options, "model", &["model"]);
+        let runtime_thought_level = runtime_option_value(&runtime_options, "thought_level", &THOUGHT_LEVEL_IDS);
+
+        if runtime_model.is_some() && runtime_thought_level.is_some() {
+            return Ok(ConversationRuntimeConfigResponse {
+                model: resolved_config_value(runtime_model, None),
+                thought_level: resolved_config_value(runtime_thought_level, None),
+                has_active_runtime,
+            });
+        }
+
+        let persisted_state = match self
+            .acp_session_repo()
+            .load_runtime_state_for_user(user_id, conversation_id)
+            .await
+        {
+            Ok(state) => state,
+            Err(err) => {
+                warn!(
+                    conversation_id,
+                    error = %ErrorChain(&err),
+                    "Failed to load persisted runtime config; using conversation snapshot",
+                );
+                None
+            }
+        };
+        let conversation_extra = serde_json::from_str::<serde_json::Value>(&row.extra).unwrap_or_default();
+
+        let snapshot_model = persisted_state
+            .as_ref()
+            .and_then(|state| non_empty_value(state.current_model_id.as_deref()))
+            .or_else(|| {
+                non_empty_value(
+                    conversation_extra
+                        .get("current_model_id")
+                        .and_then(serde_json::Value::as_str),
+                )
+            });
+        let snapshot_thought_level = persisted_state
+            .as_ref()
+            .and_then(|state| state.config_selections_json.as_deref())
+            .and_then(|raw| serde_json::from_str::<std::collections::HashMap<String, String>>(raw).ok())
+            .and_then(|selections| {
+                THOUGHT_LEVEL_IDS
+                    .iter()
+                    .find_map(|id| non_empty_value(selections.get(*id).map(String::as_str)))
+            })
+            .or_else(|| {
+                non_empty_value(
+                    conversation_extra
+                        .get("thought_level")
+                        .and_then(serde_json::Value::as_str),
+                )
+            });
+
+        Ok(ConversationRuntimeConfigResponse {
+            model: resolved_config_value(runtime_model, snapshot_model),
+            thought_level: resolved_config_value(runtime_thought_level, snapshot_thought_level),
+            has_active_runtime,
+        })
     }
 
     pub async fn set_config_option(
