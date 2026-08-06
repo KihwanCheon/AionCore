@@ -53,6 +53,7 @@ const PERM_REJECT: &str = "reject";
 /// control_request). The three accepted incoming option ids (`effort`/`reasoning_effort`/
 /// `thought_level`) all normalize to this one storage key.
 const EFFORT_CONFIG_KEY: &str = "effort";
+const EFFORT_CONFIG_ALIASES: [&str; 3] = [EFFORT_CONFIG_KEY, "reasoning_effort", "thought_level"];
 
 /// Resolve the reasoning-effort catalog to surface for the effort picker, mirroring the
 /// backend's `effort_is_supported` current-model precedence: the efforts of the resolved
@@ -437,6 +438,7 @@ impl SessionAgentTask {
             // No broadcaster: this ctor is the test/simple path, which has no
             // conversation WebSocket to push a late usage frame to.
             None,
+            None,
         )
     }
 
@@ -457,6 +459,33 @@ impl SessionAgentTask {
         prompt_dump: Option<SessionPromptDump>,
         broadcaster: Option<Arc<dyn EventBroadcaster>>,
     ) -> Arc<Self> {
+        Self::new_with_preload_and_effort(
+            agent_type,
+            conversation_id,
+            user_id,
+            workspace,
+            backend,
+            session_repo,
+            handshake,
+            prompt_dump,
+            broadcaster,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_preload_and_effort(
+        agent_type: AgentType,
+        conversation_id: String,
+        user_id: String,
+        workspace: String,
+        backend: Arc<dyn SessionBackend>,
+        session_repo: Option<Arc<dyn IAcpSessionRepository>>,
+        handshake: &aionui_api_types::AgentHandshake,
+        prompt_dump: Option<SessionPromptDump>,
+        broadcaster: Option<Arc<dyn EventBroadcaster>>,
+        restored_effort: Option<String>,
+    ) -> Arc<Self> {
         Self::build(
             agent_type,
             conversation_id,
@@ -467,6 +496,7 @@ impl SessionAgentTask {
             CatalogPreload::from_handshake(handshake),
             prompt_dump,
             broadcaster,
+            restored_effort,
         )
     }
 
@@ -481,6 +511,7 @@ impl SessionAgentTask {
         catalog_preload: CatalogPreload,
         prompt_dump: Option<SessionPromptDump>,
         broadcaster: Option<Arc<dyn EventBroadcaster>>,
+        restored_effort: Option<String>,
     ) -> Arc<Self> {
         let (tx, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let runtime = Arc::new(SessionRuntime {
@@ -491,7 +522,7 @@ impl SessionAgentTask {
             session_id: std::sync::Mutex::new(None),
             mode_override: std::sync::Mutex::new(None),
             model_override: std::sync::Mutex::new(None),
-            effort_override: std::sync::Mutex::new(None),
+            effort_override: std::sync::Mutex::new(restored_effort),
             last_catalog: std::sync::Mutex::new(None),
             caps_fallback: std::sync::Mutex::new(CapsFallback::default()),
         });
@@ -1575,10 +1606,12 @@ pub(crate) fn resolved_effort(
 ) -> Option<String> {
     session_snapshot
         .and_then(|s| {
-            s.config_selections
-                .iter()
-                .find(|(key, _)| key.as_str() == EFFORT_CONFIG_KEY)
-                .map(|(_, value)| value.as_str().to_owned())
+            EFFORT_CONFIG_ALIASES.iter().find_map(|alias| {
+                s.config_selections
+                    .iter()
+                    .find(|(key, _)| key.as_str() == *alias)
+                    .map(|(_, value)| value.as_str().to_owned())
+            })
         })
         .or_else(|| config.thought_level.clone())
         .filter(|value| !value.is_empty())
@@ -2112,7 +2145,7 @@ pub async fn build_session_instance(
     // is discovered) and drops it if unsupported — the same clear_invalid_desired_*
     // semantics as the codex model/mode reconcile. Best-effort: a dispatch failure must
     // not fail the open (the session is usable; only the persisted effort is lost).
-    if let Some(effort) = persisted_effort {
+    let restored_effort = if let Some(effort) = persisted_effort {
         if let Err(e) = backend
             .dispatch(Command::SetConfigOption {
                 option_id: EFFORT_CONFIG_KEY.to_owned(),
@@ -2121,10 +2154,14 @@ pub async fn build_session_instance(
             .await
         {
             tracing::warn!(conv_id = %conversation_id, effort = %effort, error = %e, "session-port: re-applying persisted effort failed (session usable, effort not restored)");
+            None
         } else {
             tracing::info!(conv_id = %conversation_id, effort = %effort, "session-port: re-applied persisted reasoning effort after open");
+            Some(effort)
         }
-    }
+    } else {
+        None
+    };
 
     // GAP #7 (G5): project the backend's discovered catalog back into agent_metadata
     // so the cold-start picker stays fresh. Best-effort, detached, off the open path.
@@ -2139,7 +2176,7 @@ pub async fn build_session_instance(
         backend: if backend_label == "claude" { "claude" } else { "codex" },
     });
 
-    let task = SessionAgentTask::new_with_preload(
+    let task = SessionAgentTask::new_with_preload_and_effort(
         AgentType::Acp,
         conversation_id,
         user_id,
@@ -2151,6 +2188,7 @@ pub async fn build_session_instance(
         // Lets the pump push a usage frame that arrives after the turn's relay has
         // already stopped listening — the claude case (usage rides `result`).
         Some(broadcaster),
+        restored_effort,
     );
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
@@ -4756,6 +4794,23 @@ mod build_mapping_tests {
     }
 
     #[test]
+    fn legacy_effort_keys_remain_readable_after_the_upstream_migration() {
+        for key in ["reasoning_effort", "thought_level"] {
+            let mut snapshot = PersistedSessionState::default();
+            snapshot.config_selections.insert(
+                crate::shared_kernel::ConfigKey::new(key),
+                crate::shared_kernel::ConfigValue::new("xhigh"),
+            );
+
+            assert_eq!(
+                resolved_effort(&extra_with_thought_level(None), Some(&snapshot)),
+                Some("xhigh".to_owned()),
+                "legacy key {key} must remain readable",
+            );
+        }
+    }
+
+    #[test]
     fn no_effort_anywhere_stays_none() {
         assert_eq!(resolved_effort(&extra_with_thought_level(None), None), None);
         // An empty seed is not a choice.
@@ -6696,6 +6751,32 @@ mod persist_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn restored_effort_is_the_current_value_when_backend_capabilities_do_not_track_it() {
+        let backend: Arc<dyn SessionBackend> = Arc::new(EffortCapsBackend);
+        let task = SessionAgentTask::new_with_preload_and_effort(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            backend,
+            None,
+            &aionui_api_types::AgentHandshake::default(),
+            None,
+            None,
+            Some("high".into()),
+        );
+
+        let snapshot = task.get_config_options().await.unwrap();
+        let effort = snapshot
+            .config_options
+            .iter()
+            .find(|option| option.category.as_deref() == Some("thought_level"))
+            .expect("effort axis must be available");
+
+        assert_eq!(effort.current_value.as_deref(), Some("high"));
+    }
+
     // A model with no advertised efforts (claude `haiku`) must NOT get an effort option —
     // an empty select would render a dead, choice-less group.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -7441,18 +7522,29 @@ mod pump_tests {
     // before releasing is what makes the collection deterministic — see
     // `GatedScriptBackend`.
     async fn drain_script(script: Vec<SessionEnvelope>) -> Vec<AgentStreamEvent> {
+        drain_script_with_effort(script, None).await
+    }
+
+    async fn drain_script_with_effort(
+        script: Vec<SessionEnvelope>,
+        restored_effort: Option<String>,
+    ) -> Vec<AgentStreamEvent> {
         let gate = Arc::new(tokio::sync::Notify::new());
         let backend: Arc<dyn SessionBackend> = Arc::new(GatedScriptBackend {
             script,
             gate: gate.clone(),
         });
-        let task = SessionAgentTask::new(
+        let task = SessionAgentTask::new_with_preload_and_effort(
             AgentType::Acp,
             "conv-1".into(),
             "user-1".into(),
             "/w".into(),
             backend,
             None,
+            &aionui_api_types::AgentHandshake::default(),
+            None,
+            None,
+            restored_effort,
         );
         let mut rx = crate::agent_task::IAgentTask::subscribe(task.as_ref());
         // Release only AFTER subscribing: the pump cannot emit before we listen.
@@ -7789,6 +7881,36 @@ mod pump_tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn late_catalog_keeps_the_restored_effort_selected() {
+        use aionui_session::ModelInfo;
+        let script = vec![env(SessionEvent::CatalogUpdated {
+            models: vec![ModelInfo {
+                id: "gpt-5.6-sol".into(),
+                name: "GPT-5.6-Sol".into(),
+                description: None,
+                reasoning_efforts: vec!["low".into(), "high".into(), "xhigh".into()],
+            }],
+            modes: Vec::new(),
+            slash_commands: Vec::new(),
+        })];
+
+        let frames = drain_script_with_effort(script, Some("xhigh".into())).await;
+        let config = frames
+            .iter()
+            .find_map(|frame| match frame {
+                AgentStreamEvent::AcpConfigOption(value) => Some(value),
+                _ => None,
+            })
+            .expect("late catalog must project a config snapshot");
+        let effort = config["config_options"]
+            .as_array()
+            .and_then(|options| options.iter().find(|option| option["category"] == "thought_level"))
+            .expect("late catalog includes the effort picker");
+
+        assert_eq!(effort["current_value"], "xhigh");
+    }
+
     // The FIX (async slash-command arrival push): claude advertises its command
     // list in the same late `initialize` response that carries the model/mode
     // catalog. The frontend's mount-time REST read returns empty before that
@@ -7925,6 +8047,7 @@ mod pump_tests {
                 backend: "claude",
             }),
             None,
+            None,
         );
         crate::agent_task::IAgentTask::send_message(
             task.as_ref(),
@@ -7968,6 +8091,7 @@ mod pump_tests {
                 backend: "codex",
             }),
             None,
+            None,
         );
         // Inject an image directly onto the task's dump path via a content slice
         // containing an Image block.
@@ -8002,6 +8126,7 @@ mod pump_tests {
             backend,
             None,
             CatalogPreload::default(),
+            None,
             None,
             None,
         );
