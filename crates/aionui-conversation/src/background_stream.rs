@@ -688,6 +688,60 @@ mod tests {
         assert!(kinds.contains(&"tool_group".to_owned()), "got {kinds:?}");
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn out_of_turn_config_options_are_forwarded_to_the_conversation() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::AcpConfigOption(serde_json::json!({
+                "config_options": [{
+                    "id": "reasoning_effort",
+                    "category": "thought_level",
+                    "option_type": "select",
+                    "current_value": "high",
+                    "options": [{"value": "high", "name": "high"}],
+                }],
+            })))
+            .unwrap();
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let message = ws.recv().await.unwrap();
+                if message.name == "message.stream" && message.data["type"] == "acp_config_option" {
+                    break message;
+                }
+            }
+        })
+        .await
+        .expect("late config options must reach the idle conversation");
+
+        assert_eq!(message.data["conversation_id"], "conv-1");
+        assert_eq!(message.data["data"]["config_options"][0]["current_value"], "high");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_turn_config_options_are_left_to_the_turn_relay() {
+        let rig = rig().await;
+        let claim = rig
+            .runtime_state
+            .try_claim_turn("conv-1", "turn-user")
+            .expect("claimed");
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::AcpConfigOption(serde_json::json!({
+                "config_options": [],
+            })))
+            .unwrap();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), ws.recv())
+                .await
+                .is_err(),
+            "the background watcher must not duplicate active-turn metadata"
+        );
+        drop(claim);
+    }
+
     /// The dead-conversation bug: after a background task completes, the CLI
     /// starts an unprompted turn to report the result — previously dropped
     /// wholesale. The watcher must run it through a REAL relay: text persisted,
