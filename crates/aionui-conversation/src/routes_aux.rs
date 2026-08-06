@@ -2,8 +2,8 @@
 
 use crate::state::ConversationRouterState;
 use aionui_api_types::{
-    ApiResponse, SetConfigOptionRequest, SetConfigOptionResponse, SideQuestionRequest, SideQuestionResponse,
-    SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
+    ApiResponse, ConversationRuntimeConfigResponse, SetConfigOptionRequest, SetConfigOptionResponse,
+    SideQuestionRequest, SideQuestionResponse, SlashCommandItem, WorkspaceBrowseQuery, WorkspaceEntry,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -19,6 +19,7 @@ pub fn conversation_ops_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/side-question", post(side_question))
         .route("/api/conversations/{id}/slash-commands", get(get_slash_commands))
         .route("/api/conversations/{id}/usage", get(get_usage))
+        .route("/api/conversations/{id}/runtime-config", get(get_runtime_config))
         .route(
             "/api/conversations/{id}/config-options/{option_id}",
             put(set_config_option),
@@ -52,6 +53,20 @@ async fn get_usage(
 ) -> Result<Json<ApiResponse<Option<serde_json::Value>>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         state.service.get_usage(&user.id, &id).await.map_err(ApiError::from)?,
+    )))
+}
+
+async fn get_runtime_config(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<ConversationRuntimeConfigResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_runtime_config(&user.id, &id)
+            .await
+            .map_err(ApiError::from)?,
     )))
 }
 

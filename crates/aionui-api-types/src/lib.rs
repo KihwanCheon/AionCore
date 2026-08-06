@@ -105,6 +105,9 @@ pub use conversation::{
     MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
+pub use conversation::{
+    ConversationRuntimeConfigResponse, ConversationRuntimeConfigSource, ConversationRuntimeConfigValue,
+};
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,
     ConversationCreateRequest, ConversationCreateResponse, ConversationToolDescriptor, ConversationToolErrorCode,

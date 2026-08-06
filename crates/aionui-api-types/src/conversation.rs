@@ -269,6 +269,29 @@ pub struct EnsureConversationRuntimeResponse {
     pub runtime: ConversationRuntimeSummary,
 }
 
+/// Identifies where a current conversation configuration value was resolved.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConversationRuntimeConfigSource {
+    Runtime,
+    Snapshot,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationRuntimeConfigValue {
+    pub value: Option<String>,
+    pub source: ConversationRuntimeConfigSource,
+}
+
+/// Read-only model and reasoning-effort view for an existing conversation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationRuntimeConfigResponse {
+    pub model: ConversationRuntimeConfigValue,
+    pub thought_level: ConversationRuntimeConfigValue,
+    pub has_active_runtime: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ConversationAssistantIdentityResponse {
     pub id: String,
