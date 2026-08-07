@@ -795,6 +795,9 @@ struct ClaudeReaderState {
     /// turn terminal (TurnResult / Detached). The idle timer reads it so a streaming
     /// turn is never suspended mid-flight (see SuspendController::suspend_if_idle).
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    /// Arms the zero-frame watchdog after the first prompt is delivered. Process
+    /// startup alone must not create a synthetic failed turn while the session is idle.
+    first_frame_watch_start: Arc<tokio::sync::Notify>,
     /// The OBSERVED permission mode (mirror of `ClaudeSessionBackend.current_mode_override`,
     /// shared Arc). The reader reconciles it to claude's authoritative
     /// `set_permission_mode` control_response — success echoes the applied mode
@@ -861,6 +864,7 @@ fn start_claude_reader(
             state.discovered_caps,
             state.want_init_model,
             state.turn_in_flight,
+            state.first_frame_watch_start,
             state.current_mode_override,
             state.pending_set_config,
             state.cost_ledger,
@@ -898,6 +902,7 @@ impl ClaudeSessionBackend {
         let discovered_model = Arc::new(std::sync::Mutex::new(None));
         let discovered_caps = Arc::new(std::sync::Mutex::new(DiscoveredCaps::default()));
         let turn_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_frame_watch_start = Arc::new(tokio::sync::Notify::new());
         // Shared with the reader so it can reconcile the OBSERVED mode to claude's
         // `set_permission_mode` control_response (the observed-mode track).
         let current_mode_override = Arc::new(std::sync::Mutex::new(None));
@@ -965,6 +970,7 @@ impl ClaudeSessionBackend {
             discovered_caps: discovered_caps.clone(),
             want_init_model,
             turn_in_flight: turn_in_flight.clone(),
+            first_frame_watch_start,
             current_mode_override: current_mode_override.clone(),
             pending_set_config: pending_set_config.clone(),
             cost_ledger,
@@ -1647,6 +1653,7 @@ async fn reader_task(
     discovered_caps: Arc<std::sync::Mutex<DiscoveredCaps>>,
     want_init_model: bool,
     turn_in_flight: Arc<std::sync::atomic::AtomicBool>,
+    first_frame_watch_start: Arc<tokio::sync::Notify>,
     current_mode_override: Arc<std::sync::Mutex<Option<String>>>,
     pending_set_config: Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>,
     cost_ledger: Arc<std::sync::Mutex<CostLedger>>,
@@ -1869,12 +1876,10 @@ async fn reader_task(
             }
         }
     };
-    // Startup-only zero-frame liveness (resume-hang). A claude `--resume <id>` whose
-    // on-disk session is a broken/empty husk hangs the spawned process (0% CPU,
-    // sleeping) — it emits NO stream-json frame and never EOFs, so this read would
-    // park forever, the turn never terminates, and the UI locks permanently. The
-    // existing crash self-heal can't help (it keys on an Error terminal, which a
-    // hung non-exiting process never produces).
+    // First-turn zero-frame liveness. The reader may start while the restored
+    // conversation is idle, so process startup by itself is not a turn deadline.
+    // Arm the budget only after dispatch delivers the first prompt; otherwise an
+    // idle zero-frame process would fabricate a Detached/Error turn.
     //
     // The guard is deliberately STARTUP-ONLY: we bound the read by `handshake_budget`
     // ONLY until the process has produced its very first frame; once it proves it is
@@ -1986,9 +1991,18 @@ async fn reader_task(
                     break;
                 }
             }
+        } else if !turn_in_flight.load(Ordering::SeqCst) {
+            // Opening/restoring a conversation is idle. Keep draining setup frames,
+            // but do not start a failure deadline until a prompt has been delivered.
+            tokio::select! {
+                biased;
+                r = stdout.read(&mut chunk) => r.map_err(|_| ()),
+                _ = first_frame_watch_start.notified() => continue,
+            }
         } else {
-            // Startup window: bound the FIRST frame by the handshake budget.
-            match tokio::time::timeout(super::handshake_budget(), stdout.read(&mut chunk)).await {
+            // First prompt delivered: bound the FIRST frame by the handshake budget.
+            let budget = super::handshake_budget();
+            match tokio::time::timeout(budget, stdout.read(&mut chunk)).await {
                 Ok(r) => r.map_err(|_| ()),
                 Err(_) => {
                     // Budget elapsed before the process emitted ANY frame → wedged
@@ -2004,6 +2018,12 @@ async fn reader_task(
                             "claude stdout read: startup budget elapsed with zero frames"
                         );
                     }
+                    tracing::warn!(
+                        target: "aionui_session::backend::claude_conn",
+                        conversation_id = %session_id,
+                        timeout_ms = budget.as_millis(),
+                        "claude first-frame watchdog timed out after prompt delivery"
+                    );
                     hung = true;
                     break;
                 }
@@ -3162,6 +3182,7 @@ impl SessionBackend for ClaudeSessionBackend {
                         .await
                         .map_err(|e| wrap(e.to_string()))?;
                 } // stdin lock released (microsecond frame-write lock, §5.4)
+                self.reader_state.first_frame_watch_start.notify_one();
                 tracing::info!(
                     conversation_id = %self.session_id,
                     "claude dispatch(Send): prompt delivered to stdin (awaiting CLI frames)"
@@ -4282,15 +4303,11 @@ mod tests {
         );
     }
 
-    /// Resume-hang startup guard: a `--resume` whose on-disk session is a broken husk
-    /// hangs the claude process — it emits ZERO frames and never EOFs. The reader's
-    /// STARTUP-ONLY zero-frame timeout must fire and surface a terminal `Detached` so
-    /// the FSM folds Error{Crashed}, the UI unlocks, and the next get_or_build
-    /// evicts+self-heals — instead of parking forever in `read`.
-    /// MUTATION-PROVEN: drop the startup `timeout` wrap and this test hangs (the outer
-    /// 5s guard fails) — a bare `read().await` never returns on a zero-frame hang.
+    /// A zero-frame process must remain harmless while the restored conversation is
+    /// idle, then become a terminal `Detached` if the first delivered prompt receives
+    /// no frame within the handshake budget.
     #[tokio::test]
-    async fn zero_frame_hung_startup_times_out_to_terminal_detached() {
+    async fn zero_frame_watchdog_arms_on_first_send_and_times_out_to_terminal_detached() {
         // never_exits + a gated tail never released = empty prefix (zero frames),
         // stdout stays open (never EOFs), exit never fires → a true startup hang.
         let fake = FakeAgentIo::never_exits(Vec::new()).with_gated_tail(b"unused".to_vec());
@@ -4301,6 +4318,13 @@ mod tests {
 
         let backend = ClaudeSessionBackend::build_with_io("hung-1", Box::new(fake)).await;
         let mut events = backend.events();
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(1500), events.next())
+                .await
+                .is_err(),
+            "an idle restored session must not emit Detached before the first send"
+        );
         backend
             .dispatch(Command::Send {
                 content: vec![ContentBlock::Text("hello".into())],
