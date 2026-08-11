@@ -6,11 +6,13 @@ mod agent_health_policy;
 mod background_stream;
 mod convert;
 pub mod error;
+mod external_dispatch;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;
 pub mod routes;
 pub mod routes_aux;
+mod routes_external_dispatch;
 mod runtime_completion;
 mod runtime_persistence;
 pub mod runtime_state;
@@ -28,15 +30,18 @@ pub mod task_options;
 mod turn_continuation_policy;
 mod turn_orchestrator;
 mod turn_recovery_policy;
+mod unity_turn_coordinator;
 
 pub use convert::row_to_response_with_extra;
 pub use error::ConversationError;
 pub use response_middleware::{MessageMiddleware, MiddlewareResult, strip_think_tags};
 pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
+pub use routes_external_dispatch::external_conversation_dispatch_routes;
 pub use service::is_temp_session_workspace;
 pub use service::{
-    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
+    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnResource,
+    ConversationAgentTurnResourceWaiting, ConversationAgentTurnResourceWaitingCallback, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,
 };
 pub use state::ConversationRouterState;

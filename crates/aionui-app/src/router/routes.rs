@@ -27,7 +27,7 @@ use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
 use aionui_channel::weixin_login_route;
 use aionui_common::ApiErrorLogContext;
-use aionui_conversation::{conversation_ops_routes, conversation_routes};
+use aionui_conversation::{conversation_ops_routes, conversation_routes, external_conversation_dispatch_routes};
 use aionui_cron::cron_routes;
 use aionui_extension::{extension_routes, hub_routes, skill_routes};
 use aionui_file::file_routes;
@@ -278,6 +278,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let external_launch_state = states.external_launch.clone();
     let external_launch_authenticated = external_launch_routes(external_launch_state.clone())
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let external_conversation_dispatch = external_conversation_dispatch_routes(states.conversation.clone());
 
     // System routes protected by auth middleware
     let system_authenticated =
@@ -433,6 +434,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     }
     .merge(ws_routes)
     .merge(external_launch_internal_routes(external_launch_state))
+    .merge(external_conversation_dispatch)
     .merge(runtime_team_tools)
     .merge(session_message_runtime)
     .merge(office_proxy)

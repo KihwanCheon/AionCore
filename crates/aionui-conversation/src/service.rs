@@ -65,6 +65,7 @@ use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
+use crate::unity_turn_coordinator::UnityTurnCoordinator;
 use std::sync::RwLock;
 
 pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
@@ -340,6 +341,7 @@ pub struct ConversationService {
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    unity_turn_coordinator: UnityTurnCoordinator,
 
     /// One background-stream watcher per LIVE Session instance (keyed by
     /// conversation id; value remembers the instance pointer so a rebuilt
@@ -365,8 +367,25 @@ pub struct ConversationAgentTurnRequest {
     pub required_runtime_mode: Option<String>,
     pub persist_user_message: bool,
     pub user_message_hidden: bool,
+    pub on_resource_waiting: Option<ConversationAgentTurnResourceWaitingCallback>,
     pub on_started: Option<ConversationAgentTurnStartedCallback>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationAgentTurnResource {
+    pub key: String,
+    pub project_root: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationAgentTurnResourceWaiting {
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub resource: ConversationAgentTurnResource,
+}
+
+pub type ConversationAgentTurnResourceWaitingCallback =
+    Arc<dyn Fn(ConversationAgentTurnResourceWaiting) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub type ConversationAgentTurnStartedCallback =
     Arc<dyn Fn(ConversationAgentTurnStarted) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -375,6 +394,7 @@ pub type ConversationAgentTurnStartedCallback =
 pub struct ConversationAgentTurnStarted {
     pub conversation_id: String,
     pub turn_id: String,
+    pub resource: Option<ConversationAgentTurnResource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,6 +415,33 @@ pub struct ConversationAgentTurnOutcome {
 // ── Construction & Dependency Injection ──────────────────────────────
 
 impl ConversationService {
+    pub(crate) async fn conversation_owner_user_id(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<String>, ConversationError> {
+        Ok(self.conversation_repo.owner_user_id(conversation_id).await?)
+    }
+
+    pub(crate) async fn validate_external_dispatch_target(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), ConversationError> {
+        let row = self
+            .conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        if team_id_from_extra(&row.extra).is_some() {
+            return Err(ConversationError::Forbidden {
+                reason: "Team-owned conversations cannot be used for external dispatch".into(),
+            });
+        }
+        reject_deprecated_runtime_row(&row)
+    }
+
     pub fn new(
         workspace_root: PathBuf,
         broadcaster: Arc<dyn EventBroadcaster>,
@@ -423,6 +470,7 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
+            unity_turn_coordinator: UnityTurnCoordinator::default(),
             background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             conversation_repo,
@@ -434,6 +482,10 @@ impl ConversationService {
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = runtime_state;
         self
+    }
+
+    pub(crate) fn unity_turn_coordinator(&self) -> &UnityTurnCoordinator {
+        &self.unity_turn_coordinator
     }
 
     pub fn with_runtime_helper_context(mut self, helper_bin: String, base_url: String) -> Self {
@@ -4029,6 +4081,8 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
+            on_resource_waiting: None,
+            on_started: None,
         });
 
         info!(
@@ -4099,15 +4153,23 @@ impl ConversationService {
                     .await;
                 return Err(e.into());
             }
+            if !request.user_message_hidden {
+                self.broadcaster.broadcast(WebSocketMessage::new(
+                    "message.userCreated",
+                    serde_json::json!({
+                        "user_id": &request.user_id,
+                        "conversation_id": &request.conversation_id,
+                        "msg_id": &user_msg.id,
+                        "content": &request.content,
+                        "position": "right",
+                        "status": "finish",
+                        "hidden": false,
+                        "created_at": user_msg.created_at,
+                    }),
+                ));
+                self.broadcast_list_changed(&request.user_id, &request.conversation_id, "updated", None);
+            }
         }
-        if let Some(on_started) = request.on_started.as_ref() {
-            on_started(ConversationAgentTurnStarted {
-                conversation_id: request.conversation_id.clone(),
-                turn_id: turn_id.clone(),
-            })
-            .await;
-        }
-
         let mut build_opts = match self.build_task_options(&row).await {
             Ok(opts) => opts,
             Err(err) => {
@@ -4151,6 +4213,8 @@ impl ConversationService {
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
+                on_resource_waiting: request.on_resource_waiting,
+                on_started: request.on_started,
             })
             .await;
 

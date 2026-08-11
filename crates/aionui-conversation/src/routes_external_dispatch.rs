@@ -1,0 +1,112 @@
+#![allow(clippy::disallowed_types)]
+
+use std::sync::Arc;
+
+use aionui_api_types::{ApiResponse, ExternalConversationDispatchRequest, ExternalConversationDispatchResponse};
+use aionui_common::ApiError;
+use axum::Router;
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{DefaultBodyLimit, Json, Path, State};
+use axum::http::StatusCode;
+use axum::routing::{get, post};
+
+use crate::external_dispatch::{ExternalConversationDispatchError, ExternalConversationDispatchService};
+use crate::state::ConversationRouterState;
+
+const EXTERNAL_DISPATCH_BODY_LIMIT: usize = 320 * 1024;
+
+#[derive(Clone)]
+struct ExternalConversationDispatchRouterState {
+    service: Arc<ExternalConversationDispatchService>,
+}
+
+pub fn external_conversation_dispatch_routes(state: ConversationRouterState) -> Router {
+    let state = ExternalConversationDispatchRouterState {
+        service: Arc::new(ExternalConversationDispatchService::new(state.service)),
+    };
+    Router::new()
+        .route("/api/internal/external-conversation-dispatches", post(dispatch))
+        .route(
+            "/api/internal/external-conversation-dispatches/{operation_id}",
+            get(dispatch_status),
+        )
+        .layer(DefaultBodyLimit::max(EXTERNAL_DISPATCH_BODY_LIMIT))
+        .with_state(state)
+}
+
+async fn dispatch(
+    State(state): State<ExternalConversationDispatchRouterState>,
+    body: Result<Json<ExternalConversationDispatchRequest>, JsonRejection>,
+) -> Result<(StatusCode, Json<ApiResponse<ExternalConversationDispatchResponse>>), ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let response = state.service.dispatch(request).await.map_err(map_dispatch_error)?;
+    let status = if response.repeated {
+        StatusCode::OK
+    } else {
+        StatusCode::ACCEPTED
+    };
+    Ok((status, Json(ApiResponse::ok(response))))
+}
+
+async fn dispatch_status(
+    State(state): State<ExternalConversationDispatchRouterState>,
+    Path(operation_id): Path<String>,
+) -> Result<Json<ApiResponse<ExternalConversationDispatchResponse>>, ApiError> {
+    let response = state.service.status(&operation_id).ok_or_else(|| {
+        ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "EXTERNAL_DISPATCH_NOT_FOUND",
+            "External conversation dispatch was not found.",
+            None,
+        )
+    })?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+fn map_dispatch_error(error: ExternalConversationDispatchError) -> ApiError {
+    match error {
+        ExternalConversationDispatchError::InvalidPayload => ApiError::coded(
+            StatusCode::BAD_REQUEST,
+            "EXTERNAL_DISPATCH_INVALID",
+            "External conversation dispatch payload is invalid.",
+            None,
+        ),
+        ExternalConversationDispatchError::IdempotencyConflict => ApiError::coded(
+            StatusCode::CONFLICT,
+            "EXTERNAL_DISPATCH_IDEMPOTENCY_CONFLICT",
+            "The operation id is already used for another dispatch.",
+            None,
+        ),
+        ExternalConversationDispatchError::PreparationInProgress => ApiError::coded(
+            StatusCode::CONFLICT,
+            "EXTERNAL_DISPATCH_PREPARING",
+            "The dispatch is still being prepared.",
+            None,
+        ),
+        ExternalConversationDispatchError::ActorNotFound => ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "EXTERNAL_DISPATCH_ACTOR_NOT_FOUND",
+            "The actor conversation was not found.",
+            None,
+        ),
+        ExternalConversationDispatchError::TargetNotFound => ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "EXTERNAL_DISPATCH_TARGET_NOT_FOUND",
+            "The target conversation was not found.",
+            None,
+        ),
+        ExternalConversationDispatchError::Forbidden => ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "EXTERNAL_DISPATCH_FORBIDDEN",
+            "The target conversation belongs to another user.",
+            None,
+        ),
+        ExternalConversationDispatchError::CapacityExhausted => ApiError::coded(
+            StatusCode::TOO_MANY_REQUESTS,
+            "EXTERNAL_DISPATCH_CAPACITY_EXHAUSTED",
+            "Too many external conversation dispatches are tracked.",
+            None,
+        ),
+        ExternalConversationDispatchError::Conversation(error) => ApiError::from(error),
+    }
+}

@@ -105,6 +105,7 @@ impl AgentTurnExecutionPort for TeamConversationAdapters {
                     required_runtime_mode: None,
                     persist_user_message: false,
                     user_message_hidden: false,
+                    on_resource_waiting: None,
                     on_started: on_started.clone(),
                 })
                 .await

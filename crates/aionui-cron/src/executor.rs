@@ -769,6 +769,7 @@ impl JobExecutor {
             required_runtime_mode: cron_job_runtime_mode(job).map(ToOwned::to_owned),
             persist_user_message: true,
             user_message_hidden: true,
+            on_resource_waiting: None,
             on_started,
         };
 

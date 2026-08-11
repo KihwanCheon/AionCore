@@ -4629,6 +4629,7 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
             required_runtime_mode: None,
             persist_user_message: true,
             user_message_hidden: true,
+            on_resource_waiting: None,
             on_started: None,
         })
         .await
@@ -4638,6 +4639,248 @@ async fn run_agent_turn_injects_conversation_runtime_context() {
     let options = task_mgr.captured_options();
     assert_eq!(options.len(), 1);
     assert_conversation_runtime_context(&options[0], "user_1", &conv.id);
+}
+
+#[tokio::test]
+async fn run_agent_turn_broadcasts_visible_user_message_and_list_change() {
+    let (service, broadcaster, _repo, _task_mgr) = make_service();
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let outcome = service
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "delegated card work".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            required_runtime_mode: None,
+            persist_user_message: true,
+            user_message_hidden: false,
+            on_resource_waiting: None,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    let events = broadcaster.take_events();
+    let user_created = events
+        .iter()
+        .find(|event| event.name == "message.userCreated")
+        .expect("visible agent turn should broadcast its user message");
+    assert_eq!(user_created.data["conversation_id"], conv.id);
+    assert_eq!(user_created.data["content"], "delegated card work");
+    assert_eq!(user_created.data["hidden"], false);
+
+    let list_changed = events
+        .iter()
+        .find(|event| {
+            event.name == "conversation.listChanged"
+                && event.data["conversation_id"] == conv.id
+                && event.data["action"] == "updated"
+        })
+        .expect("visible agent turn should refresh the conversation list");
+    assert_eq!(list_changed.data["user_id"], "user_1");
+}
+
+#[tokio::test]
+async fn run_agent_turn_waits_for_another_turn_using_the_same_unity_project() {
+    let (service, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let unity_project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(unity_project.path().join("Assets")).unwrap();
+    std::fs::create_dir(unity_project.path().join("ProjectSettings")).unwrap();
+    std::fs::write(
+        unity_project.path().join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3",
+    )
+    .unwrap();
+    {
+        let mut rows = repo.rows.lock().unwrap();
+        let row = rows.iter_mut().find(|row| row.id == conv.id).unwrap();
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+        extra["workspace"] = json!(unity_project.path());
+        extra["mcp_servers"] = json!(["MindNProgress", "unityMCP"]);
+        row.extra = extra.to_string();
+    }
+    let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let first_permit = service
+        .unity_turn_coordinator()
+        .claim_for_conversation_extra(&row.extra)
+        .unwrap()
+        .try_acquire()
+        .ok()
+        .expect("first Unity turn permit");
+
+    let waiting = Arc::new(Notify::new());
+    let started = Arc::new(Notify::new());
+    let waiting_callback = Arc::clone(&waiting);
+    let started_callback = Arc::clone(&started);
+    let service_for_turn = service.clone();
+    let conversation_id = conv.id.clone();
+    let turn = tokio::spawn(async move {
+        service_for_turn
+            .run_agent_turn(ConversationAgentTurnRequest {
+                user_id: "user_1".into(),
+                conversation_id,
+                content: "edit the Unity scene".into(),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                required_runtime_mode: None,
+                persist_user_message: true,
+                user_message_hidden: false,
+                on_resource_waiting: Some(Arc::new(move |event| {
+                    let waiting = Arc::clone(&waiting_callback);
+                    Box::pin(async move {
+                        assert!(event.resource.key.starts_with("unity:"));
+                        waiting.notify_one();
+                    })
+                })),
+                on_started: Some(Arc::new(move |_| {
+                    let started = Arc::clone(&started_callback);
+                    Box::pin(async move { started.notify_one() })
+                })),
+            })
+            .await
+            .unwrap()
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), waiting.notified())
+        .await
+        .expect("Unity waiting callback");
+    assert!(!turn.is_finished());
+    drop(first_permit);
+    tokio::time::timeout(Duration::from_secs(1), started.notified())
+        .await
+        .expect("Unity started callback");
+    let outcome = tokio::time::timeout(Duration::from_secs(2), turn)
+        .await
+        .expect("Unity turn completion")
+        .unwrap();
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+}
+
+#[tokio::test]
+async fn run_agent_turn_can_be_cancelled_while_waiting_for_the_unity_project() {
+    let (service, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    let unity_project = tempfile::tempdir().unwrap();
+    std::fs::create_dir(unity_project.path().join("Assets")).unwrap();
+    std::fs::create_dir(unity_project.path().join("ProjectSettings")).unwrap();
+    std::fs::write(
+        unity_project.path().join("ProjectSettings/ProjectVersion.txt"),
+        "m_EditorVersion: 2022.3",
+    )
+    .unwrap();
+    {
+        let mut rows = repo.rows.lock().unwrap();
+        let row = rows.iter_mut().find(|row| row.id == conv.id).unwrap();
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+        extra["workspace"] = json!(unity_project.path());
+        extra["mcp_servers"] = json!(["unityMCP"]);
+        row.extra = extra.to_string();
+    }
+    let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let first_permit = service
+        .unity_turn_coordinator()
+        .claim_for_conversation_extra(&row.extra)
+        .unwrap()
+        .try_acquire()
+        .ok()
+        .expect("first Unity turn permit");
+
+    let waiting = Arc::new(Notify::new());
+    let waiting_callback = Arc::clone(&waiting);
+    let waiting_turn_id = Arc::new(Mutex::new(None));
+    let waiting_turn_id_callback = Arc::clone(&waiting_turn_id);
+    let started = Arc::new(Notify::new());
+    let started_callback = Arc::clone(&started);
+    let service_for_turn = service.clone();
+    let conversation_id = conv.id.clone();
+    let turn = tokio::spawn(async move {
+        service_for_turn
+            .run_agent_turn(ConversationAgentTurnRequest {
+                user_id: "user_1".into(),
+                conversation_id,
+                content: "cancel this queued Unity edit".into(),
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+                required_runtime_mode: None,
+                persist_user_message: true,
+                user_message_hidden: false,
+                on_resource_waiting: Some(Arc::new(move |event| {
+                    let waiting = Arc::clone(&waiting_callback);
+                    let waiting_turn_id = Arc::clone(&waiting_turn_id_callback);
+                    Box::pin(async move {
+                        *waiting_turn_id.lock().unwrap() = Some(event.turn_id);
+                        waiting.notify_one();
+                    })
+                })),
+                on_started: Some(Arc::new(move |_| {
+                    let started = Arc::clone(&started_callback);
+                    Box::pin(async move { started.notify_one() })
+                })),
+            })
+            .await
+            .unwrap()
+    });
+
+    tokio::time::timeout(Duration::from_secs(1), waiting.notified())
+        .await
+        .expect("Unity waiting callback");
+    let turn_id = waiting_turn_id.lock().unwrap().clone().expect("waiting turn id");
+    service.runtime_state().defer_cancel(&conv.id, &turn_id);
+    let outcome = tokio::time::timeout(Duration::from_secs(1), turn)
+        .await
+        .expect("queued Unity turn cancellation")
+        .unwrap();
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), started.notified())
+            .await
+            .is_err(),
+        "cancelled queued turn must not start"
+    );
+    drop(first_permit);
+}
+
+#[tokio::test]
+async fn run_agent_turn_does_not_broadcast_visible_events_for_hidden_message() {
+    let (service, broadcaster, _repo, _task_mgr) = make_service();
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let outcome = service
+        .run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "hidden scheduled work".into(),
+            files: Vec::new(),
+            inject_skills: Vec::new(),
+            required_runtime_mode: None,
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_resource_waiting: None,
+            on_started: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    let events = broadcaster.take_events();
+    assert!(
+        events.iter().all(|event| event.name != "message.userCreated"),
+        "hidden agent turn must not expose its user message"
+    );
+    assert!(
+        events.iter().all(|event| {
+            event.name != "conversation.listChanged"
+                || event.data["conversation_id"] != conv.id
+                || event.data["action"] != "updated"
+        }),
+        "hidden agent turn must not move the conversation in the visible list"
+    );
 }
 
 #[tokio::test]
@@ -5364,6 +5607,7 @@ async fn run_agent_turn_applies_required_runtime_mode_after_stream_subscription(
             required_runtime_mode: Some("yolo".to_owned()),
             persist_user_message: true,
             user_message_hidden: true,
+            on_resource_waiting: None,
             on_started: None,
         })
         .await
@@ -6331,6 +6575,7 @@ async fn run_agent_turn_returns_error_message_when_agent_build_fails() {
             required_runtime_mode: None,
             persist_user_message: true,
             user_message_hidden: true,
+            on_resource_waiting: None,
             on_started: None,
         })
         .await
@@ -9730,6 +9975,7 @@ async fn cron_required_runtime_mode_wins_over_resolved_permission_seed() {
             required_runtime_mode: Some("default".to_owned()),
             persist_user_message: true,
             user_message_hidden: true,
+            on_resource_waiting: None,
             on_started: None,
         })
         .await
