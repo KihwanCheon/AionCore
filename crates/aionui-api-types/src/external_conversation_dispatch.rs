@@ -48,6 +48,7 @@ pub enum ExternalConversationDispatchState {
     Starting,
     WaitingResource,
     Running,
+    WaitingResume,
     Completed,
     Failed,
 }
@@ -134,5 +135,21 @@ mod tests {
         assert_eq!(value["state"], "waiting_resource");
         assert_eq!(value["resource"]["kind"], "unity_project");
         assert_eq!(value["resource"]["key"], "unity:abc123");
+    }
+
+    #[test]
+    fn waiting_resume_has_a_stable_wire_value() {
+        let value = serde_json::to_value(ExternalConversationDispatchResponse {
+            operation_id: "operation-3".to_owned(),
+            conversation_id: "target-3".to_owned(),
+            state: ExternalConversationDispatchState::WaitingResume,
+            turn_id: Some("turn-interrupted".to_owned()),
+            error_message: None,
+            resource: None,
+            repeated: false,
+        })
+        .unwrap();
+
+        assert_eq!(value["state"], "waiting_resume");
     }
 }

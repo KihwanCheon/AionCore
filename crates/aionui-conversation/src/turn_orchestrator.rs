@@ -10,8 +10,7 @@ use tokio::sync::oneshot;
 use tracing::{debug, error, info, warn};
 
 use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
-use crate::runtime_state::RuntimeLifecycleState;
-use crate::runtime_state::TurnClaim;
+use crate::runtime_state::{RuntimeLifecycleState, TurnClaim};
 use crate::service::{
     ConversationAgentTurnResource, ConversationAgentTurnResourceWaiting, ConversationAgentTurnStarted,
     ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
@@ -52,6 +51,7 @@ pub(crate) struct TurnStartInput {
 pub(crate) enum ConversationTurnStatus {
     Completed,
     Failed,
+    Interrupted,
 }
 
 pub(crate) struct ConversationTurnResult {
@@ -238,9 +238,8 @@ impl ConversationTurnOrchestrator {
         // Honour it here, BEFORE the prompt goes out: the user withdrew this
         // turn, so the cleanest outcome is that the CLI never runs at all.
         //
-        // Ends as Completed, not Failed — a turn the user cancelled is not an
-        // error, and reporting one would surface a red bubble for something
-        // they asked for.
+        // A user cancellation is non-error, but callers that coordinate a
+        // follow-up turn must not mistake it for completed work.
         if runtime_state.take_deferred_cancel(&input.conv_id, &input.turn_id) {
             info!(
                 conversation_id = %input.conv_id,
@@ -266,7 +265,7 @@ impl ConversationTurnOrchestrator {
                 &input.msg_id,
             );
             return Err(ConversationTurnResult {
-                status: ConversationTurnStatus::Completed,
+                status: ConversationTurnStatus::Interrupted,
                 error_message: None,
             });
         }
@@ -522,8 +521,14 @@ impl ConversationTurnOrchestrator {
                             self.service
                                 .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
                                 .await;
+                            self.service.record_agent_turn_terminal(
+                                &conv_id,
+                                &turn_id,
+                                ConversationTurnStatus::Interrupted,
+                                None,
+                            );
                             return ConversationTurnResult {
-                                status: ConversationTurnStatus::Completed,
+                                status: ConversationTurnStatus::Interrupted,
                                 error_message: None,
                             };
                         }
@@ -552,8 +557,10 @@ impl ConversationTurnOrchestrator {
                 .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
                 .await;
             drop(unity_permit);
+            self.service
+                .record_agent_turn_terminal(&conv_id, &turn_id, ConversationTurnStatus::Interrupted, None);
             return ConversationTurnResult {
-                status: ConversationTurnStatus::Completed,
+                status: ConversationTurnStatus::Interrupted,
                 error_message: None,
             };
         }
@@ -569,6 +576,7 @@ impl ConversationTurnOrchestrator {
 
         info!(conversation_id = %conv_id, turn_id = %turn_id, "conversation turn orchestrator started");
 
+        let mut attempt_interrupted = false;
         let final_failed = loop {
             let attempt_number = if replayed { 2 } else { 1 };
             let attempt_result = match self
@@ -591,6 +599,7 @@ impl ConversationTurnOrchestrator {
                 Ok(result) => result,
                 Err(result) => {
                     final_error_message = result.error_message;
+                    attempt_interrupted = result.status == ConversationTurnStatus::Interrupted;
                     break result.status == ConversationTurnStatus::Failed;
                 }
             };
@@ -707,6 +716,7 @@ impl ConversationTurnOrchestrator {
             }
         };
 
+        let interrupted = attempt_interrupted || runtime_state.is_cancelling(&conv_id);
         if auth_failure {
             // The agent connected (detection saw it online) but a real turn hit
             // an explicit auth signal — write "needs sign-in" back to its
@@ -721,7 +731,7 @@ impl ConversationTurnOrchestrator {
                     .unwrap_or("Agent requires sign-in to run."),
             )
             .await;
-        } else if !final_failed {
+        } else if !final_failed && !interrupted {
             record_agent_session_success(
                 &self.service,
                 &input.user_id,
@@ -736,14 +746,18 @@ impl ConversationTurnOrchestrator {
             .await;
         drop(unity_permit);
 
-        ConversationTurnResult {
-            status: if final_failed {
-                ConversationTurnStatus::Failed
-            } else {
-                ConversationTurnStatus::Completed
-            },
-            error_message: if final_failed { final_error_message } else { None },
-        }
+        let status = if interrupted {
+            ConversationTurnStatus::Interrupted
+        } else if final_failed {
+            ConversationTurnStatus::Failed
+        } else {
+            ConversationTurnStatus::Completed
+        };
+        let error_message = if final_failed { final_error_message } else { None };
+        self.service
+            .record_agent_turn_terminal(&conv_id, &turn_id, status, error_message.clone());
+
+        ConversationTurnResult { status, error_message }
     }
 }
 

@@ -4837,6 +4837,10 @@ async fn run_agent_turn_can_be_cancelled_while_waiting_for_the_unity_project() {
         .unwrap();
     assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
     assert!(
+        outcome.interrupted,
+        "cancelled queued turn must be distinguishable from completed work"
+    );
+    assert!(
         tokio::time::timeout(Duration::from_millis(100), started.notified())
             .await
             .is_err(),
@@ -4950,6 +4954,27 @@ async fn runtime_summary_reports_backend_static_midturn_bit_without_live_agent()
     // Unknown conversation id → conservative false, no panic.
     let runtime = svc.runtime_summary_for("conv-does-not-exist").await;
     assert!(!runtime.supports_midturn_delivery);
+}
+
+#[tokio::test]
+async fn ordinary_user_turn_publishes_a_terminal_observation_for_external_resume_tracking() {
+    let (service, _broadcaster, _repo, task_manager) = make_service();
+    let conv = service.create("user_1", make_create_req()).await.unwrap();
+
+    let response = service
+        .send_message("user_1", &conv.id, make_send_req(), &task_manager)
+        .await
+        .unwrap();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(2),
+        service.wait_for_agent_turn_after(&conv.id, "turn-interrupted-before-resume"),
+    )
+    .await
+    .expect("ordinary follow-up turn should publish its terminal observation");
+
+    assert_eq!(outcome.turn_id, response.turn_id);
+    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
+    assert!(!outcome.interrupted);
 }
 
 #[tokio::test]

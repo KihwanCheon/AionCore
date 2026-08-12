@@ -1,4 +1,5 @@
 mod mcp_reload;
+mod turn_observation;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -67,6 +68,7 @@ use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
 use crate::unity_turn_coordinator::UnityTurnCoordinator;
 use std::sync::RwLock;
+use turn_observation::TurnObservationService;
 
 pub(crate) const MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN: usize = 4;
 const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
@@ -338,6 +340,7 @@ pub struct ConversationService {
     /// conversation create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
+    turn_observation: TurnObservationService,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
@@ -408,6 +411,7 @@ pub struct ConversationAgentTurnOutcome {
     pub conversation_id: String,
     pub turn_id: String,
     pub status: ConversationAgentTurnStatus,
+    pub interrupted: bool,
     pub error_message: Option<String>,
     pub runtime: ConversationRuntimeSummary,
 }
@@ -467,6 +471,7 @@ impl ConversationService {
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
+            turn_observation: TurnObservationService::default(),
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
@@ -4093,6 +4098,12 @@ impl ConversationService {
                 let was_deleting = turn_claim.release();
                 self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
                     .await;
+                self.record_agent_turn_terminal(
+                    conversation_id,
+                    &turn_id,
+                    ConversationTurnStatus::Failed,
+                    Some(send_error_display_message(&send_error)),
+                );
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
@@ -4218,13 +4229,21 @@ impl ConversationService {
                 let was_deleting = turn_claim.release();
                 self.complete_released_turn(&request.user_id, &request.conversation_id, &turn_id, was_deleting)
                     .await;
-                return Ok(ConversationAgentTurnOutcome {
+                let outcome = ConversationAgentTurnOutcome {
                     conversation_id: request.conversation_id.clone(),
-                    turn_id,
+                    turn_id: turn_id.clone(),
                     status: ConversationAgentTurnStatus::Failed,
+                    interrupted: false,
                     error_message: Some(send_error_display_message(&send_error)),
                     runtime: self.runtime_summary_for(&request.conversation_id).await,
-                });
+                };
+                self.record_agent_turn_terminal(
+                    &outcome.conversation_id,
+                    &outcome.turn_id,
+                    ConversationTurnStatus::Failed,
+                    outcome.error_message.clone(),
+                );
+                return Ok(outcome);
             }
         };
 
@@ -4249,16 +4268,20 @@ impl ConversationService {
             })
             .await;
 
-        Ok(ConversationAgentTurnOutcome {
+        let outcome = ConversationAgentTurnOutcome {
             runtime: self.runtime_summary_for(&conversation_id).await,
             conversation_id,
             turn_id,
             status: match result.status {
-                ConversationTurnStatus::Completed => ConversationAgentTurnStatus::Completed,
+                ConversationTurnStatus::Completed | ConversationTurnStatus::Interrupted => {
+                    ConversationAgentTurnStatus::Completed
+                }
                 ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
             },
+            interrupted: result.status == ConversationTurnStatus::Interrupted,
             error_message: result.error_message,
-        })
+        };
+        Ok(outcome)
     }
 
     pub async fn latest_conversation_error_message(
