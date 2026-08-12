@@ -179,6 +179,22 @@ impl ConversationRuntimeStateService {
             .and_then(|state| state.active_turns.get(conversation_id).cloned())
     }
 
+    pub fn active_conversation_ids(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .map(|state| {
+                state
+                    .active_turns
+                    .keys()
+                    .chain(state.cancelling_conversations.iter())
+                    .cloned()
+                    .collect::<HashSet<_>>()
+                    .into_iter()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     pub async fn wait_until_unclaimed(&self, conversation_id: &str) {
         loop {
             let notified = self.release_notify.notified();
@@ -635,6 +651,21 @@ mod tests {
         let summary = state.summary_from_parts("conv-1", None, false, 0, false);
         assert_eq!(summary.turn_id.as_deref(), Some("turn-a"));
         assert_eq!(summary.state, ConversationRuntimeStateKind::Starting);
+    }
+
+    #[test]
+    fn active_conversation_ids_deduplicates_claimed_and_cancelling_conversations() {
+        let state = Arc::new(ConversationRuntimeStateService::default());
+        let _claim = state
+            .try_claim_turn("conv-1", "turn-a")
+            .expect("claim should be created");
+        state.mark_cancelling("conv-1");
+        state.mark_cancelling("conv-2");
+
+        let mut ids = state.active_conversation_ids();
+        ids.sort();
+
+        assert_eq!(ids, vec!["conv-1", "conv-2"]);
     }
 
     #[test]

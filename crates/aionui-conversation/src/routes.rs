@@ -6,6 +6,7 @@ use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, patch, post, put};
 
+use aionui_api_types::ActiveConversationRuntimesResponse;
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
@@ -16,7 +17,7 @@ use aionui_api_types::{
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
-use aionui_common::ApiError;
+use aionui_common::{ApiError, now_ms};
 
 use crate::ConversationError;
 use crate::state::ConversationRouterState;
@@ -144,6 +145,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/asks/{requestId}/answer", post(answer_ask))
         .route("/api/conversations/{id}/approvals/check", get(check_approval))
         .route("/api/conversations/active-count", get(active_count))
+        .route("/api/internal/conversation-runtimes/active", get(active_runtimes))
         .route("/api/conversations/clone", post(clone))
         .route("/api/messages/search", get(search_messages))
         .with_state(state)
@@ -567,6 +569,18 @@ async fn active_count(
 ) -> Result<Json<ApiResponse<ActiveCountResponse>>, ApiError> {
     let count = state.service.active_count_for_user(&user.id).await?;
     Ok(Json(ApiResponse::ok(ActiveCountResponse { count })))
+}
+
+async fn active_runtimes(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<ActiveConversationRuntimesResponse>>, ApiError> {
+    let items = state.service.active_runtime_summaries_for_user(&user.id).await?;
+    Ok(Json(ApiResponse::ok(ActiveConversationRuntimesResponse {
+        schema_version: 1,
+        generated_at: now_ms(),
+        items,
+    })))
 }
 
 #[cfg(test)]

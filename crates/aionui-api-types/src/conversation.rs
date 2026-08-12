@@ -263,6 +263,20 @@ pub struct ConversationRuntimeSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveConversationRuntime {
+    pub conversation_id: String,
+    pub runtime: ConversationRuntimeSummary,
+}
+
+/// Active-only runtime snapshot for lightweight integration polling.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveConversationRuntimesResponse {
+    pub schema_version: u32,
+    pub generated_at: TimestampMs,
+    pub items: Vec<ActiveConversationRuntime>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EnsureConversationRuntimeResponse {
     pub recovered: bool,
     pub config_options: Vec<AcpConfigOptionDto>,
