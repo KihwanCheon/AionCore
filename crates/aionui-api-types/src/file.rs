@@ -121,6 +121,12 @@ pub struct ReadFileRequest {
     pub workspace: Option<String>,
 }
 
+/// Request body for `POST /api/fs/git-branches`.
+#[derive(Debug, Deserialize)]
+pub struct GitBranchesRequest {
+    pub workspaces: Vec<String>,
+}
+
 /// Request body for `POST /api/fs/write` — write file.
 #[derive(Debug, Deserialize)]
 pub struct WriteFileRequest {
@@ -246,6 +252,13 @@ pub struct CopyFailure {
 pub struct CopyFilesResponse {
     pub copied_files: Vec<String>,
     pub failed_files: Vec<CopyFailure>,
+}
+
+/// Current Git branch for one requested workspace.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceGitBranchResponse {
+    pub workspace: String,
+    pub branch: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

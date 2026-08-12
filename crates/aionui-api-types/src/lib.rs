@@ -143,6 +143,7 @@ pub use file::{
     SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery,
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
 };
+pub use file::{GitBranchesRequest, WorkspaceGitBranchResponse};
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{
     BatchImportMcpServersRequest, CreateMcpServerRequest, DetectedMcpServerEntry, DetectedMcpServerResponse,

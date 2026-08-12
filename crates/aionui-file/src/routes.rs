@@ -19,6 +19,7 @@ use aionui_api_types::{
     SnapshotInfoResponse, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery, WorkspaceFlatFileResponse,
     WriteContentRequest, WriteFileRequest,
 };
+use aionui_api_types::{GitBranchesRequest, WorkspaceGitBranchResponse};
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
@@ -134,6 +135,7 @@ pub fn file_routes(state: FileRouterState) -> Router {
         .route("/api/fs/list", post(list_workspace_files))
         .route("/api/fs/metadata", post(get_file_metadata))
         .route("/api/fs/read", post(read_file))
+        .route("/api/fs/git-branches", post(git_branches))
         .route("/api/fs/write", post(write_file))
         .route("/api/fs/copy", post(copy_files))
         .route("/api/fs/reveal", post(reveal_item))
@@ -213,6 +215,22 @@ async fn read_file(
         .read_file(&req.path, req.workspace.as_deref().map(Path::new))
         .await?;
     Ok(Json(ApiResponse::ok(content)))
+}
+
+async fn git_branches(
+    State(state): State<FileRouterState>,
+    body: Result<Json<GitBranchesRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<Vec<WorkspaceGitBranchResponse>>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let branches = state.file_service.get_git_branches(&req.workspaces).await?;
+    let response = branches
+        .into_iter()
+        .map(|item| WorkspaceGitBranchResponse {
+            workspace: item.workspace,
+            branch: item.branch,
+        })
+        .collect();
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn write_file(
