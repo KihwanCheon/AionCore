@@ -94,6 +94,7 @@ pub use chat_file::ChatFileRef;
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::ReloadConversationMcpServersRequest;
+pub use conversation::{ActiveConversationRuntime, ActiveConversationRuntimesResponse};
 pub use conversation::{
     ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
     CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,

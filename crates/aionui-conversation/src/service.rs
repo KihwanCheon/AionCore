@@ -29,7 +29,7 @@ use aionui_api_types::{
     UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
-use aionui_api_types::{ChatFileRef, SessionRef};
+use aionui_api_types::{ActiveConversationRuntime, ChatFileRef, SessionRef};
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
     OnConversationTurnCancelled, PaginatedResult, TurnCancelCause, WorkspacePathValidationError, generate_short_id,
@@ -921,6 +921,37 @@ impl ConversationService {
             }
         }
         Ok(count)
+    }
+
+    pub async fn active_runtime_summaries_for_user(
+        &self,
+        user_id: &str,
+    ) -> Result<Vec<ActiveConversationRuntime>, ConversationError> {
+        let mut conversation_ids: HashSet<_> = self.task_manager.active_conversation_ids().into_iter().collect();
+        conversation_ids.extend(self.runtime_state.active_conversation_ids());
+        let mut conversation_ids: Vec<_> = conversation_ids.into_iter().collect();
+        conversation_ids.sort();
+
+        let mut items = Vec::new();
+        for conversation_id in conversation_ids {
+            let runtime = self.runtime_summary_for(&conversation_id).await;
+            if !runtime.is_processing {
+                continue;
+            }
+            let belongs_to_user = self
+                .conversation_repo
+                .get(user_id, &conversation_id)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+                .is_some();
+            if belongs_to_user {
+                items.push(ActiveConversationRuntime {
+                    conversation_id,
+                    runtime,
+                });
+            }
+        }
+        Ok(items)
     }
 
     pub async fn terminate_runtime_for_user(&self, user_id: &str) -> Result<usize, ConversationError> {

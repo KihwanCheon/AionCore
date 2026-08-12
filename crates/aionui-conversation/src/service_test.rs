@@ -20,8 +20,8 @@ use aionui_ai_agent::{
 
 use aionui_api_types::{
     AcpConfigOptionDto, AgentErrorCode, AgentModeResponse, ConfigOptionConfirmation, ConversationArtifactKind,
-    ConversationResponse, ConversationRuntimeConfigSource, GetConfigOptionsResponse, GetModelInfoResponse,
-    ModelInfoEntry, ModelInfoPayload, SetConfigOptionRequest, SetConfigOptionResponse,
+    ConversationResponse, ConversationRuntimeConfigSource, ConversationRuntimeStateKind, GetConfigOptionsResponse,
+    GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
     CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ReloadConversationMcpServersRequest,
@@ -5150,6 +5150,28 @@ async fn active_count_for_user_counts_only_owned_active_tasks() {
     assert_eq!(svc.active_count_for_user("user_1").await.unwrap(), 1);
     assert_eq!(svc.active_count_for_user("user_2").await.unwrap(), 1);
     assert_eq!(svc.active_count_for_user("user_3").await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn active_runtime_summaries_include_only_owned_processing_conversations() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let user_1_active = svc.create("user_1", make_create_req()).await.unwrap();
+    let user_1_idle = svc.create("user_1", make_create_req()).await.unwrap();
+    let user_2_active = svc.create("user_2", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(
+        &user_1_idle.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&user_1_idle.id))),
+    );
+    let runtime_state = svc.runtime_state();
+    let _user_1_claim = runtime_state.try_claim_turn(&user_1_active.id, "turn-user-1").unwrap();
+    let _user_2_claim = runtime_state.try_claim_turn(&user_2_active.id, "turn-user-2").unwrap();
+
+    let items = svc.active_runtime_summaries_for_user("user_1").await.unwrap();
+
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].conversation_id, user_1_active.id);
+    assert_eq!(items[0].runtime.state, ConversationRuntimeStateKind::Starting);
 }
 
 #[tokio::test]
