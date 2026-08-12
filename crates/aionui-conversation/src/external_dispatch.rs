@@ -11,6 +11,7 @@ use aionui_api_types::{
     ExternalConversationDispatchStrategy,
 };
 use serde_json::{Value, json};
+use tracing::info;
 
 use crate::error::ConversationError;
 use crate::service::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService};
@@ -186,14 +187,46 @@ impl ExternalConversationDispatchService {
                 .await;
 
             match outcome {
-                Ok(outcome) => service.update_response(&operation_id, |response| {
-                    response.turn_id = Some(outcome.turn_id);
-                    response.state = match outcome.status {
-                        ConversationAgentTurnStatus::Completed => ExternalConversationDispatchState::Completed,
-                        ConversationAgentTurnStatus::Failed => ExternalConversationDispatchState::Failed,
-                    };
-                    response.error_message = outcome.error_message;
-                }),
+                Ok(mut outcome) => loop {
+                    if outcome.interrupted {
+                        let interrupted_turn_id = outcome.turn_id.clone();
+                        service.update_response(&operation_id, |response| {
+                            response.turn_id = Some(interrupted_turn_id.clone());
+                            response.state = ExternalConversationDispatchState::WaitingResume;
+                            response.error_message = None;
+                            response.resource = None;
+                        });
+                        info!(
+                            operation_id,
+                            conversation_id,
+                            turn_id = %interrupted_turn_id,
+                            "external conversation dispatch waiting for a resumed turn"
+                        );
+                        outcome = service
+                            .conversation_service
+                            .wait_for_agent_turn_after(&conversation_id, &interrupted_turn_id)
+                            .await;
+                        info!(
+                            operation_id,
+                            conversation_id,
+                            turn_id = %outcome.turn_id,
+                            interrupted = outcome.interrupted,
+                            "external conversation dispatch observed a follow-up turn"
+                        );
+                        continue;
+                    }
+
+                    service.update_response(&operation_id, |response| {
+                        response.turn_id = Some(outcome.turn_id);
+                        response.state = match outcome.status {
+                            ConversationAgentTurnStatus::Completed => ExternalConversationDispatchState::Completed,
+                            ConversationAgentTurnStatus::Failed => ExternalConversationDispatchState::Failed,
+                        };
+                        response.error_message = outcome.error_message;
+                        response.resource = None;
+                    });
+                    break;
+                },
                 Err(error) => service.update_response(&operation_id, |response| {
                     response.state = ExternalConversationDispatchState::Failed;
                     response.error_message = Some(error.to_string());
