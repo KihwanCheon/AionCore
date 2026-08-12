@@ -18,6 +18,7 @@ pub use traits::{
     ClipboardWriterRef, FileServiceRef, IClipboardWriter, IFileService, IItemRevealer, ISnapshotService,
     ISystemFileOpener, ItemRevealerRef, SnapshotServiceRef, SystemFileOpenerRef,
 };
+pub use types::WorkspaceGitBranch;
 pub use types::{
     CompareResult, ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileChangeInfo, FileMetadata,
     SnapshotInfo, SnapshotMode, WorkspaceFlatFile,

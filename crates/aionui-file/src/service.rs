@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,12 +16,16 @@ use aionui_realtime::EventBroadcaster;
 use crate::path_safety::{
     has_traversal, strip_verbatim_prefix, validate_path_for_write, validate_path_with_extra_root,
 };
+use crate::types::WorkspaceGitBranch;
 use crate::types::{
     ContentUpdateEvent, ContentUpdateOperation, CopyResult, DirOrFile, FileMetadata, WorkspaceFlatFile,
 };
 
 /// Maximum number of files returned by `list_workspace_files`.
 const MAX_WORKSPACE_FILES: usize = 20_000;
+
+/// Maximum number of workspaces accepted by one Git branch batch request.
+const MAX_GIT_BRANCH_WORKSPACES: usize = 256;
 
 /// Maximum file size for read operations (256 MB).
 const MAX_FILE_SIZE: u64 = 256 * 1024 * 1024;
@@ -566,6 +571,24 @@ fn validate_remote_image_url(raw_url: &str) -> Result<reqwest::Url, String> {
     Ok(url)
 }
 
+fn current_git_branch(workspace: &Path) -> Option<String> {
+    let repository = git2::Repository::open(workspace).ok()?;
+    if let Ok(head) = repository.head() {
+        if head.is_branch() {
+            return head.shorthand().ok().map(ToOwned::to_owned);
+        }
+        return head.target().map(|oid| oid.to_string().chars().take(7).collect());
+    }
+
+    repository
+        .find_reference("HEAD")
+        .ok()?
+        .symbolic_target()
+        .ok()??
+        .strip_prefix("refs/heads/")
+        .map(ToOwned::to_owned)
+}
+
 #[async_trait::async_trait]
 impl crate::traits::IFileService for FileService {
     // -- Content endpoint (pre-resolved absolute paths) --
@@ -705,6 +728,35 @@ impl crate::traits::IFileService for FileService {
         tokio::task::spawn_blocking(move || read_file_sync(&canonical))
             .await
             .map_err(|e| FileError::Internal(format!("read file task failed: {e}")))?
+    }
+
+    async fn get_git_branches(&self, workspaces: &[String]) -> Result<Vec<WorkspaceGitBranch>, FileError> {
+        if workspaces.len() > MAX_GIT_BRANCH_WORKSPACES {
+            return Err(FileError::BadRequest(format!(
+                "at most {MAX_GIT_BRANCH_WORKSPACES} workspaces may be requested"
+            )));
+        }
+        if workspaces.iter().any(String::is_empty) {
+            return Err(FileError::BadRequest("workspace must not be empty".to_owned()));
+        }
+
+        let mut seen = HashSet::new();
+        let workspaces: Vec<_> = workspaces
+            .iter()
+            .filter(|workspace| seen.insert((*workspace).clone()))
+            .cloned()
+            .collect();
+        tokio::task::spawn_blocking(move || {
+            workspaces
+                .into_iter()
+                .map(|workspace| WorkspaceGitBranch {
+                    branch: current_git_branch(Path::new(&workspace)),
+                    workspace,
+                })
+                .collect()
+        })
+        .await
+        .map_err(|e| FileError::Internal(format!("git branch batch task failed: {e}")))
     }
 
     async fn write_file(&self, path: &str, data: &[u8], workspace: &str) -> Result<bool, FileError> {

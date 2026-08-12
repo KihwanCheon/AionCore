@@ -7,6 +7,7 @@ use crate::error::FileError;
 
 use aionui_api_types::ContentEncoding;
 
+use crate::types::WorkspaceGitBranch;
 use crate::types::{CompareResult, CopyResult, DirOrFile, FileMetadata, SnapshotInfo, WorkspaceFlatFile};
 
 /// Core file operations: directory browsing, file read/write, management,
@@ -63,6 +64,10 @@ pub trait IFileService: Send + Sync {
     /// Read a file as UTF-8 text. Returns `None` if the file does not exist.
     /// Files larger than 256 MB are rejected.
     async fn read_file(&self, path: &str, extra_root: Option<&Path>) -> Result<Option<String>, FileError>;
+
+    /// Resolve the current Git branch for multiple workspaces in one operation.
+    /// Non-repositories and unreadable repositories produce `branch = None`.
+    async fn get_git_branches(&self, workspaces: &[String]) -> Result<Vec<WorkspaceGitBranch>, FileError>;
 
     /// Write `data` to `path`. On success, emits a
     /// `fileStream.contentUpdate` event with `operation = write`.

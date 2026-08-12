@@ -44,6 +44,13 @@ pub struct WorkspaceFlatFile {
     pub relative_path: String,
 }
 
+/// Current Git branch resolved for a workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceGitBranch {
+    pub workspace: String,
+    pub branch: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // File metadata
 // ---------------------------------------------------------------------------
