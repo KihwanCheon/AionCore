@@ -4685,9 +4685,12 @@ async fn run_agent_turn_broadcasts_visible_user_message_and_list_change() {
 }
 
 #[tokio::test]
-async fn run_agent_turn_waits_for_another_turn_using_the_same_unity_project() {
-    let (service, _broadcaster, repo, _task_mgr) = make_service();
-    let conv = service.create("user_1", make_create_req()).await.unwrap();
+async fn run_agent_turn_does_not_serialize_conversations_using_the_same_unity_project() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+    let (service, _broadcaster, repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let first_conv = service.create("user_1", make_create_req()).await.unwrap();
+    let second_conv = service.create("user_1", make_create_req()).await.unwrap();
     let unity_project = tempfile::tempdir().unwrap();
     std::fs::create_dir(unity_project.path().join("Assets")).unwrap();
     std::fs::create_dir(unity_project.path().join("ProjectSettings")).unwrap();
@@ -4698,155 +4701,48 @@ async fn run_agent_turn_waits_for_another_turn_using_the_same_unity_project() {
     .unwrap();
     {
         let mut rows = repo.rows.lock().unwrap();
-        let row = rows.iter_mut().find(|row| row.id == conv.id).unwrap();
-        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
-        extra["workspace"] = json!(unity_project.path());
-        extra["mcp_servers"] = json!(["MindNProgress", "unityMCP"]);
-        row.extra = extra.to_string();
+        for conversation_id in [&first_conv.id, &second_conv.id] {
+            let row = rows.iter_mut().find(|row| row.id == *conversation_id).unwrap();
+            let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+            extra["workspace"] = json!(unity_project.path());
+            extra["mcp_servers"] = json!(["MindNProgress", "unityMCP"]);
+            row.extra = extra.to_string();
+        }
     }
-    let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
-    let first_permit = service
-        .unity_turn_coordinator()
-        .claim_for_conversation_extra(&row.extra)
-        .unwrap()
-        .try_acquire()
-        .ok()
-        .expect("first Unity turn permit");
 
-    let waiting = Arc::new(Notify::new());
-    let started = Arc::new(Notify::new());
-    let waiting_callback = Arc::clone(&waiting);
-    let started_callback = Arc::clone(&started);
-    let service_for_turn = service.clone();
-    let conversation_id = conv.id.clone();
-    let turn = tokio::spawn(async move {
-        service_for_turn
-            .run_agent_turn(ConversationAgentTurnRequest {
-                user_id: "user_1".into(),
-                conversation_id,
-                content: "edit the Unity scene".into(),
-                files: Vec::new(),
-                inject_skills: Vec::new(),
-                required_runtime_mode: None,
-                persist_user_message: true,
-                user_message_hidden: false,
-                on_resource_waiting: Some(Arc::new(move |event| {
-                    let waiting = Arc::clone(&waiting_callback);
-                    Box::pin(async move {
-                        assert!(event.resource.key.starts_with("unity:"));
-                        waiting.notify_one();
-                    })
-                })),
-                on_started: Some(Arc::new(move |_| {
-                    let started = Arc::clone(&started_callback);
-                    Box::pin(async move { started.notify_one() })
-                })),
-            })
-            .await
-            .unwrap()
-    });
+    let first_agent = Arc::new(BlockingCancelAgent::new(&first_conv.id));
+    let second_agent = Arc::new(BlockingCancelAgent::new(&second_conv.id));
+    task_mgr.insert_agent(&first_conv.id, AgentInstance::Mock(first_agent.clone()));
+    task_mgr.insert_agent(&second_conv.id, AgentInstance::Mock(second_agent.clone()));
 
-    tokio::time::timeout(Duration::from_secs(1), waiting.notified())
+    let first_started_agent = first_agent.clone();
+    let first_started = tokio::spawn(async move { first_started_agent.wait_until_send_started().await });
+    tokio::task::yield_now().await;
+    service
+        .send_message("user_1", &first_conv.id, make_send_req(), &task_mgr_dyn)
         .await
-        .expect("Unity waiting callback");
-    assert!(!turn.is_finished());
-    drop(first_permit);
-    tokio::time::timeout(Duration::from_secs(1), started.notified())
-        .await
-        .expect("Unity started callback");
-    let outcome = tokio::time::timeout(Duration::from_secs(2), turn)
-        .await
-        .expect("Unity turn completion")
         .unwrap();
-    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
-}
-
-#[tokio::test]
-async fn run_agent_turn_can_be_cancelled_while_waiting_for_the_unity_project() {
-    let (service, _broadcaster, repo, _task_mgr) = make_service();
-    let conv = service.create("user_1", make_create_req()).await.unwrap();
-    let unity_project = tempfile::tempdir().unwrap();
-    std::fs::create_dir(unity_project.path().join("Assets")).unwrap();
-    std::fs::create_dir(unity_project.path().join("ProjectSettings")).unwrap();
-    std::fs::write(
-        unity_project.path().join("ProjectSettings/ProjectVersion.txt"),
-        "m_EditorVersion: 2022.3",
-    )
-    .unwrap();
-    {
-        let mut rows = repo.rows.lock().unwrap();
-        let row = rows.iter_mut().find(|row| row.id == conv.id).unwrap();
-        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
-        extra["workspace"] = json!(unity_project.path());
-        extra["mcp_servers"] = json!(["unityMCP"]);
-        row.extra = extra.to_string();
-    }
-    let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
-    let first_permit = service
-        .unity_turn_coordinator()
-        .claim_for_conversation_extra(&row.extra)
-        .unwrap()
-        .try_acquire()
-        .ok()
-        .expect("first Unity turn permit");
-
-    let waiting = Arc::new(Notify::new());
-    let waiting_callback = Arc::clone(&waiting);
-    let waiting_turn_id = Arc::new(Mutex::new(None));
-    let waiting_turn_id_callback = Arc::clone(&waiting_turn_id);
-    let started = Arc::new(Notify::new());
-    let started_callback = Arc::clone(&started);
-    let service_for_turn = service.clone();
-    let conversation_id = conv.id.clone();
-    let turn = tokio::spawn(async move {
-        service_for_turn
-            .run_agent_turn(ConversationAgentTurnRequest {
-                user_id: "user_1".into(),
-                conversation_id,
-                content: "cancel this queued Unity edit".into(),
-                files: Vec::new(),
-                inject_skills: Vec::new(),
-                required_runtime_mode: None,
-                persist_user_message: true,
-                user_message_hidden: false,
-                on_resource_waiting: Some(Arc::new(move |event| {
-                    let waiting = Arc::clone(&waiting_callback);
-                    let waiting_turn_id = Arc::clone(&waiting_turn_id_callback);
-                    Box::pin(async move {
-                        *waiting_turn_id.lock().unwrap() = Some(event.turn_id);
-                        waiting.notify_one();
-                    })
-                })),
-                on_started: Some(Arc::new(move |_| {
-                    let started = Arc::clone(&started_callback);
-                    Box::pin(async move { started.notify_one() })
-                })),
-            })
-            .await
-            .unwrap()
-    });
-
-    tokio::time::timeout(Duration::from_secs(1), waiting.notified())
+    tokio::time::timeout(Duration::from_secs(1), first_started)
         .await
-        .expect("Unity waiting callback");
-    let turn_id = waiting_turn_id.lock().unwrap().clone().expect("waiting turn id");
-    service.runtime_state().defer_cancel(&conv.id, &turn_id);
-    let outcome = tokio::time::timeout(Duration::from_secs(1), turn)
-        .await
-        .expect("queued Unity turn cancellation")
+        .expect("first Unity conversation did not start")
         .unwrap();
-    assert_eq!(outcome.status, ConversationAgentTurnStatus::Completed);
-    assert!(
-        outcome.interrupted,
-        "cancelled queued turn must be distinguishable from completed work"
-    );
-    assert!(
-        tokio::time::timeout(Duration::from_millis(100), started.notified())
-            .await
-            .is_err(),
-        "cancelled queued turn must not start"
-    );
-    drop(first_permit);
+
+    let second_started_agent = second_agent.clone();
+    let second_started = tokio::spawn(async move { second_started_agent.wait_until_send_started().await });
+    tokio::task::yield_now().await;
+    service
+        .send_message("user_1", &second_conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), second_started)
+        .await
+        .expect("second Unity conversation was serialized behind the first")
+        .unwrap();
+
+    first_agent.release_finish();
+    second_agent.release_finish();
+    wait_for_turn_released(&service, &first_conv.id).await;
+    wait_for_turn_released(&service, &second_conv.id).await;
 }
 
 #[tokio::test]

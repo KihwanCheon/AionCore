@@ -30,7 +30,6 @@ pub mod task_options;
 mod turn_continuation_policy;
 mod turn_orchestrator;
 mod turn_recovery_policy;
-mod unity_turn_coordinator;
 
 pub use convert::row_to_response_with_extra;
 pub use error::ConversationError;

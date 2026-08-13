@@ -66,7 +66,6 @@ use crate::session_mentions;
 use crate::skill_resolver::SkillResolver;
 use crate::skill_snapshot::{backfill_skills_if_missing, compute_initial_skills};
 use crate::turn_orchestrator::{ConversationTurnOrchestrator, ConversationTurnStatus, TurnStartInput};
-use crate::unity_turn_coordinator::UnityTurnCoordinator;
 use std::sync::RwLock;
 use turn_observation::TurnObservationService;
 
@@ -344,8 +343,6 @@ pub struct ConversationService {
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
-    unity_turn_coordinator: UnityTurnCoordinator,
-
     /// One background-stream watcher per LIVE Session instance (keyed by
     /// conversation id; value remembers the instance pointer so a rebuilt
     /// instance gets a fresh watcher). See `background_stream.rs` for why:
@@ -475,7 +472,6 @@ impl ConversationService {
             runtime_helper_bin: None,
             runtime_base_url: None,
             runtime_token_service: None,
-            unity_turn_coordinator: UnityTurnCoordinator::default(),
             background_watchers: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
 
             conversation_repo,
@@ -487,10 +483,6 @@ impl ConversationService {
     pub fn with_runtime_state(mut self, runtime_state: Arc<ConversationRuntimeStateService>) -> Self {
         self.runtime_state = runtime_state;
         self
-    }
-
-    pub(crate) fn unity_turn_coordinator(&self) -> &UnityTurnCoordinator {
-        &self.unity_turn_coordinator
     }
 
     pub fn with_runtime_helper_context(mut self, helper_bin: String, base_url: String) -> Self {
@@ -4123,7 +4115,6 @@ impl ConversationService {
             stored_workspace,
             turn_id: turn_id.clone(),
             turn_claim,
-            on_resource_waiting: None,
             on_started: None,
         });
 
@@ -4263,7 +4254,6 @@ impl ConversationService {
                 stored_workspace,
                 turn_id: turn_id.clone(),
                 turn_claim,
-                on_resource_waiting: request.on_resource_waiting,
                 on_started: request.on_started,
             })
             .await;
