@@ -12,8 +12,8 @@ use tracing::{debug, error, info, warn};
 use crate::agent_health_policy::{AgentHealthAction, AgentHealthPolicy};
 use crate::runtime_state::{RuntimeLifecycleState, TurnClaim};
 use crate::service::{
-    ConversationAgentTurnResource, ConversationAgentTurnResourceWaiting, ConversationAgentTurnStarted,
-    ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN, agent_error_top_level_code, persist_session_key,
+    ConversationAgentTurnStarted, ConversationService, MAX_SYSTEM_RESPONSE_CONTINUATIONS_PER_TURN,
+    agent_error_top_level_code, persist_session_key,
 };
 use crate::stream_relay::{RelayOutcome, StreamRelay, SupersedingTipTotals, TurnAttemptSummary};
 use crate::turn_continuation_policy::{ContinuationDecision, TurnContinuationPolicy};
@@ -43,7 +43,6 @@ pub(crate) struct TurnStartInput {
     pub stored_workspace: String,
     pub turn_id: String,
     pub turn_claim: TurnClaim,
-    pub on_resource_waiting: Option<crate::service::ConversationAgentTurnResourceWaitingCallback>,
     pub on_started: Option<crate::service::ConversationAgentTurnStartedCallback>,
 }
 
@@ -480,72 +479,8 @@ impl ConversationTurnOrchestrator {
         let mut final_error_message;
         let mut auth_failure = false;
 
-        let mut turn_resource = None;
-        let unity_permit = if let Some(claim) = self
-            .service
-            .unity_turn_coordinator()
-            .claim_for_conversation_extra(&input.conversation.extra)
-        {
-            let resource = ConversationAgentTurnResource {
-                key: claim.resource().key.clone(),
-                project_root: claim.resource().project_root.clone(),
-            };
-            turn_resource = Some(resource.clone());
-            match claim.try_acquire() {
-                Ok(permit) => Some(permit),
-                Err(waiting) => {
-                    if let Some(on_resource_waiting) = input.on_resource_waiting.as_ref() {
-                        on_resource_waiting(ConversationAgentTurnResourceWaiting {
-                            conversation_id: conv_id.clone(),
-                            turn_id: turn_id.clone(),
-                            resource,
-                        })
-                        .await;
-                    }
-                    info!(
-                        conversation_id = %conv_id,
-                        turn_id = %turn_id,
-                        resource_key = %waiting.resource().key,
-                        project_root = %waiting.resource().project_root,
-                        "conversation turn waiting for Unity project"
-                    );
-                    let mut wait = Box::pin(waiting.wait());
-                    loop {
-                        if runtime_state.take_deferred_cancel(&conv_id, &turn_id) {
-                            info!(
-                                conversation_id = %conv_id,
-                                turn_id = %turn_id,
-                                "cancelled conversation turn while waiting for Unity project"
-                            );
-                            let was_deleting = turn_claim.release_for_turn(&turn_id);
-                            self.service
-                                .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
-                                .await;
-                            self.service.record_agent_turn_terminal(
-                                &conv_id,
-                                &turn_id,
-                                ConversationTurnStatus::Interrupted,
-                                None,
-                            );
-                            return ConversationTurnResult {
-                                status: ConversationTurnStatus::Interrupted,
-                                error_message: None,
-                            };
-                        }
-                        tokio::select! {
-                            permit = &mut wait => break Some(permit),
-                            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
-                        }
-                    }
-                }
-            }
-        } else {
-            None
-        };
-
-        // The Unity permit and a deferred cancel can become ready in the same
-        // scheduler tick. Recheck after acquisition so a cancelled queued turn
-        // never reaches the agent merely because the mutex branch won the race.
+        // A cancel can arrive while the background turn is being prepared.
+        // Recheck immediately before starting the agent.
         if runtime_state.take_deferred_cancel(&conv_id, &turn_id) {
             info!(
                 conversation_id = %conv_id,
@@ -556,7 +491,6 @@ impl ConversationTurnOrchestrator {
             self.service
                 .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
                 .await;
-            drop(unity_permit);
             self.service
                 .record_agent_turn_terminal(&conv_id, &turn_id, ConversationTurnStatus::Interrupted, None);
             return ConversationTurnResult {
@@ -569,7 +503,7 @@ impl ConversationTurnOrchestrator {
             on_started(ConversationAgentTurnStarted {
                 conversation_id: conv_id.clone(),
                 turn_id: turn_id.clone(),
-                resource: turn_resource,
+                resource: None,
             })
             .await;
         }
@@ -744,8 +678,6 @@ impl ConversationTurnOrchestrator {
         self.service
             .complete_released_turn(&input.user_id, &conv_id, &turn_id, was_deleting)
             .await;
-        drop(unity_permit);
-
         let status = if interrupted {
             ConversationTurnStatus::Interrupted
         } else if final_failed {
