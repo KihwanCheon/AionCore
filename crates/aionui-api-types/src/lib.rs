@@ -132,6 +132,9 @@ pub use extension::{
     InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
 pub use external_conversation_dispatch::{
+    ExternalConversationDispatchCapabilities, ExternalConversationDispatchWorkspaceLease,
+};
+pub use external_conversation_dispatch::{
     ExternalConversationDispatchCreateOptions, ExternalConversationDispatchRequest,
     ExternalConversationDispatchResource, ExternalConversationDispatchResponse, ExternalConversationDispatchState,
     ExternalConversationDispatchStrategy,

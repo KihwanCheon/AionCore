@@ -29,6 +29,26 @@ pub struct ExternalConversationDispatchCreateOptions {
     pub workspace: Option<String>,
 }
 
+/// Workspace lease assigned by an external orchestrator when an existing
+/// conversation is resumed for a new job.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalConversationDispatchWorkspaceLease {
+    pub workspace_id: String,
+    pub job_id: String,
+    pub lease_id: String,
+    pub project_root: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExternalConversationDispatchCapabilities {
+    pub schema_version: u32,
+    pub workspace_lease_version: u32,
+    pub atomic_workspace_rebind: bool,
+    pub releases_runtime_on_terminal: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExternalConversationDispatchRequest {
@@ -40,6 +60,8 @@ pub struct ExternalConversationDispatchRequest {
     pub instruction: String,
     #[serde(default)]
     pub create: Option<ExternalConversationDispatchCreateOptions>,
+    #[serde(default)]
+    pub workspace_lease: Option<ExternalConversationDispatchWorkspaceLease>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -94,6 +116,42 @@ mod tests {
         assert_eq!(request.operation_id, "operation-1");
         assert_eq!(request.strategy, ExternalConversationDispatchStrategy::Resume);
         assert_eq!(request.target_conversation_id.as_deref(), Some("target-1"));
+        assert!(request.workspace_lease.is_none());
+    }
+
+    #[test]
+    fn workspace_lease_uses_camel_case_wire_fields() {
+        let request: ExternalConversationDispatchRequest = serde_json::from_value(serde_json::json!({
+            "operationId": "operation-2",
+            "actorConversationId": "actor-1",
+            "strategy": "resume",
+            "targetConversationId": "target-1",
+            "instruction": "Continue the work",
+            "workspaceLease": {
+                "workspaceId": "fork2",
+                "jobId": "job-12",
+                "leaseId": "lease-opaque",
+                "projectRoot": "C:/Git/Holdem_Fork2/hdtf-client"
+            }
+        }))
+        .unwrap();
+
+        let workspace = request.workspace_lease.unwrap();
+        assert_eq!(workspace.workspace_id, "fork2");
+        assert_eq!(workspace.project_root, "C:/Git/Holdem_Fork2/hdtf-client");
+    }
+
+    #[test]
+    fn capabilities_publish_workspace_lease_contract() {
+        let value = serde_json::to_value(ExternalConversationDispatchCapabilities {
+            schema_version: 1,
+            workspace_lease_version: 1,
+            atomic_workspace_rebind: true,
+            releases_runtime_on_terminal: true,
+        })
+        .unwrap();
+        assert_eq!(value["workspaceLeaseVersion"], 1);
+        assert_eq!(value["atomicWorkspaceRebind"], true);
     }
 
     #[test]

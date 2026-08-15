@@ -8,7 +8,7 @@ use aionui_api_types::{
     AssistantConversationOverridesRequest, AssistantConversationRequest, CreateConversationRequest,
     ExternalConversationDispatchCreateOptions, ExternalConversationDispatchRequest,
     ExternalConversationDispatchResource, ExternalConversationDispatchResponse, ExternalConversationDispatchState,
-    ExternalConversationDispatchStrategy,
+    ExternalConversationDispatchStrategy, ExternalConversationDispatchWorkspaceLease,
 };
 use serde_json::{Value, json};
 use tracing::info;
@@ -135,7 +135,11 @@ impl ExternalConversationDispatchService {
 
         let service = self.clone();
         let operation_id = request.operation_id.clone();
+        let workspace_rebind = (request.strategy == ExternalConversationDispatchStrategy::Resume)
+            .then(|| request.workspace_lease.as_ref().map(|lease| lease.project_root.clone()))
+            .flatten();
         let instruction = request.instruction;
+        let release_workspace_runtime = request.workspace_lease.is_some();
         tokio::spawn(async move {
             let started_service = service.clone();
             let started_operation_id = operation_id.clone();
@@ -143,47 +147,50 @@ impl ExternalConversationDispatchService {
             let waiting_operation_id = operation_id.clone();
             let outcome = service
                 .conversation_service
-                .run_agent_turn(ConversationAgentTurnRequest {
-                    user_id,
-                    conversation_id: conversation_id.clone(),
-                    content: instruction,
-                    files: Vec::new(),
-                    inject_skills: Vec::new(),
-                    required_runtime_mode: None,
-                    persist_user_message: true,
-                    user_message_hidden: false,
-                    on_resource_waiting: Some(Arc::new(move |waiting| {
-                        let waiting_service = waiting_service.clone();
-                        let operation_id = waiting_operation_id.clone();
-                        Box::pin(async move {
-                            waiting_service.update_response(&operation_id, |response| {
-                                response.state = ExternalConversationDispatchState::WaitingResource;
-                                response.turn_id = Some(waiting.turn_id);
-                                response.resource = Some(ExternalConversationDispatchResource {
-                                    kind: "unity_project".to_owned(),
-                                    key: waiting.resource.key,
-                                    project_root: waiting.resource.project_root,
-                                });
-                            });
-                        })
-                    })),
-                    on_started: Some(Arc::new(move |started| {
-                        let started_service = started_service.clone();
-                        let operation_id = started_operation_id.clone();
-                        Box::pin(async move {
-                            started_service.update_response(&operation_id, |response| {
-                                response.state = ExternalConversationDispatchState::Running;
-                                response.turn_id = Some(started.turn_id);
-                                response.resource =
-                                    started.resource.map(|resource| ExternalConversationDispatchResource {
+                .run_agent_turn_in_workspace(
+                    ConversationAgentTurnRequest {
+                        user_id,
+                        conversation_id: conversation_id.clone(),
+                        content: instruction,
+                        files: Vec::new(),
+                        inject_skills: Vec::new(),
+                        required_runtime_mode: None,
+                        persist_user_message: true,
+                        user_message_hidden: false,
+                        on_resource_waiting: Some(Arc::new(move |waiting| {
+                            let waiting_service = waiting_service.clone();
+                            let operation_id = waiting_operation_id.clone();
+                            Box::pin(async move {
+                                waiting_service.update_response(&operation_id, |response| {
+                                    response.state = ExternalConversationDispatchState::WaitingResource;
+                                    response.turn_id = Some(waiting.turn_id);
+                                    response.resource = Some(ExternalConversationDispatchResource {
                                         kind: "unity_project".to_owned(),
-                                        key: resource.key,
-                                        project_root: resource.project_root,
+                                        key: waiting.resource.key,
+                                        project_root: waiting.resource.project_root,
                                     });
-                            });
-                        })
-                    })),
-                })
+                                });
+                            })
+                        })),
+                        on_started: Some(Arc::new(move |started| {
+                            let started_service = started_service.clone();
+                            let operation_id = started_operation_id.clone();
+                            Box::pin(async move {
+                                started_service.update_response(&operation_id, |response| {
+                                    response.state = ExternalConversationDispatchState::Running;
+                                    response.turn_id = Some(started.turn_id);
+                                    response.resource =
+                                        started.resource.map(|resource| ExternalConversationDispatchResource {
+                                            kind: "unity_project".to_owned(),
+                                            key: resource.key,
+                                            project_root: resource.project_root,
+                                        });
+                                });
+                            })
+                        })),
+                    },
+                    workspace_rebind.as_deref(),
+                )
                 .await;
 
             match outcome {
@@ -216,6 +223,12 @@ impl ExternalConversationDispatchService {
                         continue;
                     }
 
+                    if release_workspace_runtime {
+                        service
+                            .conversation_service
+                            .release_workspace_runtime_for_external_dispatch(&conversation_id)
+                            .await;
+                    }
                     service.update_response(&operation_id, |response| {
                         response.turn_id = Some(outcome.turn_id);
                         response.state = match outcome.status {
@@ -227,10 +240,18 @@ impl ExternalConversationDispatchService {
                     });
                     break;
                 },
-                Err(error) => service.update_response(&operation_id, |response| {
-                    response.state = ExternalConversationDispatchState::Failed;
-                    response.error_message = Some(error.to_string());
-                }),
+                Err(error) => {
+                    if release_workspace_runtime {
+                        service
+                            .conversation_service
+                            .release_workspace_runtime_for_external_dispatch(&conversation_id)
+                            .await;
+                    }
+                    service.update_response(&operation_id, |response| {
+                        response.state = ExternalConversationDispatchState::Failed;
+                        response.error_message = Some(error.to_string());
+                    });
+                }
             }
         });
 
@@ -275,6 +296,17 @@ impl ExternalConversationDispatchService {
                 self.conversation_service
                     .validate_external_dispatch_target(&user_id, target_id)
                     .await?;
+                if let Some(workspace) = request.workspace_lease.as_ref() {
+                    info!(
+                        operation_id = %request.operation_id,
+                        conversation_id = %target_id,
+                        workspace_id = %workspace.workspace_id,
+                        job_id = %workspace.job_id,
+                        lease_id = %workspace.lease_id,
+                        project_root = %workspace.project_root,
+                        "external conversation dispatch accepted target workspace lease"
+                    );
+                }
                 target_id.to_owned()
             }
             ExternalConversationDispatchStrategy::New => {
@@ -286,6 +318,17 @@ impl ExternalConversationDispatchService {
                     .conversation_service
                     .create(&user_id, create_conversation_request(create))
                     .await?;
+                if let Some(workspace) = request.workspace_lease.as_ref() {
+                    info!(
+                        operation_id = %request.operation_id,
+                        conversation_id = %conversation.id,
+                        workspace_id = %workspace.workspace_id,
+                        job_id = %workspace.job_id,
+                        lease_id = %workspace.lease_id,
+                        project_root = %workspace.project_root,
+                        "external conversation dispatch created target in leased workspace"
+                    );
+                }
                 conversation.id
             }
         };
@@ -368,18 +411,39 @@ fn validate_request(request: &ExternalConversationDispatchRequest) -> Result<(),
             {
                 return Err(ExternalConversationDispatchError::InvalidPayload);
             }
+            if let Some(workspace) = request.workspace_lease.as_ref() {
+                validate_workspace_lease(workspace)?;
+            }
         }
         ExternalConversationDispatchStrategy::New => {
             if request.target_conversation_id.is_some() {
                 return Err(ExternalConversationDispatchError::InvalidPayload);
             }
-            validate_create_options(
-                request
-                    .create
-                    .as_ref()
-                    .ok_or(ExternalConversationDispatchError::InvalidPayload)?,
-            )?;
+            let create = request
+                .create
+                .as_ref()
+                .ok_or(ExternalConversationDispatchError::InvalidPayload)?;
+            validate_create_options(create)?;
+            if let Some(workspace) = request.workspace_lease.as_ref() {
+                validate_workspace_lease(workspace)?;
+                if create.workspace.as_deref() != Some(workspace.project_root.as_str()) {
+                    return Err(ExternalConversationDispatchError::InvalidPayload);
+                }
+            }
         }
+    }
+    Ok(())
+}
+
+fn validate_workspace_lease(
+    workspace: &ExternalConversationDispatchWorkspaceLease,
+) -> Result<(), ExternalConversationDispatchError> {
+    if !valid_identifier(&workspace.workspace_id, MAX_OPTION_CHARS)
+        || !valid_identifier(&workspace.job_id, MAX_OPTION_CHARS)
+        || !valid_identifier(&workspace.lease_id, MAX_OPTION_CHARS)
+        || !valid_option(&workspace.project_root, MAX_WORKSPACE_CHARS)
+    {
+        return Err(ExternalConversationDispatchError::InvalidPayload);
     }
     Ok(())
 }
@@ -444,6 +508,7 @@ mod tests {
             target_conversation_id: Some("target-1".to_owned()),
             instruction: "Continue the card work".to_owned(),
             create: None,
+            workspace_lease: None,
         }
     }
 
@@ -484,6 +549,54 @@ mod tests {
             workspace: Some("D:/workspace".to_owned()),
         });
         assert!(validate_request(&valid).is_ok());
+    }
+
+    #[test]
+    fn resume_accepts_a_bounded_workspace_lease() {
+        let mut valid = request(ExternalConversationDispatchStrategy::Resume);
+        valid.workspace_lease = Some(ExternalConversationDispatchWorkspaceLease {
+            workspace_id: "fork2".to_owned(),
+            job_id: "job-20260815-0012".to_owned(),
+            lease_id: "lease-opaque-id".to_owned(),
+            project_root: "C:/Git/Holdem_Fork2/hdtf-client".to_owned(),
+        });
+        assert!(validate_request(&valid).is_ok());
+
+        valid.workspace_lease.as_mut().unwrap().lease_id = "lease:invalid".to_owned();
+        assert!(matches!(
+            validate_request(&valid),
+            Err(ExternalConversationDispatchError::InvalidPayload)
+        ));
+    }
+
+    #[test]
+    fn new_accepts_matching_workspace_lease() {
+        let mut valid = request(ExternalConversationDispatchStrategy::New);
+        valid.target_conversation_id = None;
+        valid.create = Some(ExternalConversationDispatchCreateOptions {
+            agent_id: "agent-codex".to_owned(),
+            title: None,
+            model_id: None,
+            mode: None,
+            thought_level: None,
+            enabled_skill_ids: None,
+            disabled_builtin_skill_ids: None,
+            mcp_ids: None,
+            workspace: Some("D:/workspace".to_owned()),
+        });
+        valid.workspace_lease = Some(ExternalConversationDispatchWorkspaceLease {
+            workspace_id: "fork2".to_owned(),
+            job_id: "job-12".to_owned(),
+            lease_id: "lease-12".to_owned(),
+            project_root: "D:/workspace".to_owned(),
+        });
+        assert!(validate_request(&valid).is_ok());
+
+        valid.create.as_mut().unwrap().workspace = Some("D:/other".to_owned());
+        assert!(matches!(
+            validate_request(&valid),
+            Err(ExternalConversationDispatchError::InvalidPayload)
+        ));
     }
 
     #[test]
