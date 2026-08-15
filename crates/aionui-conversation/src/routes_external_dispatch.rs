@@ -25,7 +25,10 @@ struct ExternalConversationDispatchRouterState {
 
 pub fn external_conversation_dispatch_routes(state: ConversationRouterState) -> Router {
     let state = ExternalConversationDispatchRouterState {
-        service: Arc::new(ExternalConversationDispatchService::new(state.service)),
+        service: Arc::new(ExternalConversationDispatchService::new(
+            state.service,
+            state.external_dispatch_repository,
+        )),
     };
     Router::new()
         .route("/api/internal/external-conversation-dispatches", post(dispatch))
@@ -43,10 +46,11 @@ pub fn external_conversation_dispatch_routes(state: ConversationRouterState) -> 
 
 async fn dispatch_capabilities() -> Json<ApiResponse<ExternalConversationDispatchCapabilities>> {
     Json(ApiResponse::ok(ExternalConversationDispatchCapabilities {
-        schema_version: 1,
+        schema_version: 2,
         workspace_lease_version: 1,
         atomic_workspace_rebind: true,
         releases_runtime_on_terminal: true,
+        persistent_recovery_state: true,
     }))
 }
 
@@ -68,14 +72,19 @@ async fn dispatch_status(
     State(state): State<ExternalConversationDispatchRouterState>,
     Path(operation_id): Path<String>,
 ) -> Result<Json<ApiResponse<ExternalConversationDispatchResponse>>, ApiError> {
-    let response = state.service.status(&operation_id).ok_or_else(|| {
-        ApiError::coded(
-            StatusCode::NOT_FOUND,
-            "EXTERNAL_DISPATCH_NOT_FOUND",
-            "External conversation dispatch was not found.",
-            None,
-        )
-    })?;
+    let response = state
+        .service
+        .status(&operation_id)
+        .await
+        .map_err(map_dispatch_error)?
+        .ok_or_else(|| {
+            ApiError::coded(
+                StatusCode::NOT_FOUND,
+                "EXTERNAL_DISPATCH_NOT_FOUND",
+                "External conversation dispatch was not found.",
+                None,
+            )
+        })?;
     Ok(Json(ApiResponse::ok(response)))
 }
 
@@ -122,6 +131,12 @@ fn map_dispatch_error(error: ExternalConversationDispatchError) -> ApiError {
             "EXTERNAL_DISPATCH_CAPACITY_EXHAUSTED",
             "Too many external conversation dispatches are tracked.",
             None,
+        ),
+        ExternalConversationDispatchError::Persistence(error) => ApiError::coded(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "EXTERNAL_DISPATCH_STORAGE_FAILED",
+            "External conversation dispatch state could not be stored.",
+            Some(serde_json::json!({ "reason": error.to_string() })),
         ),
         ExternalConversationDispatchError::Conversation(error) => ApiError::from(error),
     }

@@ -47,6 +47,7 @@ pub struct ExternalConversationDispatchCapabilities {
     pub workspace_lease_version: u32,
     pub atomic_workspace_rebind: bool,
     pub releases_runtime_on_terminal: bool,
+    pub persistent_recovery_state: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -71,6 +72,7 @@ pub enum ExternalConversationDispatchState {
     WaitingResource,
     Running,
     WaitingResume,
+    RecoveryRequired,
     Completed,
     Failed,
 }
@@ -148,6 +150,7 @@ mod tests {
             workspace_lease_version: 1,
             atomic_workspace_rebind: true,
             releases_runtime_on_terminal: true,
+            persistent_recovery_state: true,
         })
         .unwrap();
         assert_eq!(value["workspaceLeaseVersion"], 1);
@@ -209,5 +212,21 @@ mod tests {
         .unwrap();
 
         assert_eq!(value["state"], "waiting_resume");
+    }
+
+    #[test]
+    fn recovery_required_has_a_stable_wire_value() {
+        let value = serde_json::to_value(ExternalConversationDispatchResponse {
+            operation_id: "operation-4".to_owned(),
+            conversation_id: "target-4".to_owned(),
+            state: ExternalConversationDispatchState::RecoveryRequired,
+            turn_id: None,
+            error_message: Some("interrupted_by_restart".to_owned()),
+            resource: None,
+            repeated: true,
+        })
+        .unwrap();
+
+        assert_eq!(value["state"], "recovery_required");
     }
 }

@@ -515,6 +515,7 @@ impl Drop for MigrateLockGuard {
 /// added after a table was first created may be missing. This function
 /// safely adds any missing columns via `ALTER TABLE ADD COLUMN`.
 async fn ensure_schema_columns(pool: &SqlitePool) -> Result<(), DbError> {
+    crate::fork_extensions::migration_compat::remap_external_dispatch_migration_version(pool).await?;
     reconcile_mcp_server_schema(pool).await?;
     crate::legacy_handoff::ensure_legacy_handoff_schema(pool).await?;
     Ok(())

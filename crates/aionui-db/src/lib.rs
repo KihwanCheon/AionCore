@@ -4,6 +4,7 @@
 mod agent_binding;
 mod database;
 mod error;
+pub mod fork_extensions;
 mod instance_lock;
 mod legacy_handoff;
 mod migrate_repair;

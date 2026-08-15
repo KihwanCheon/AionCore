@@ -524,6 +524,9 @@ pub fn build_conversation_state(
         service: conversation_service,
         task_manager: services.worker_task_manager.clone(),
         active_leases: services.active_lease_registry.clone(),
+        external_dispatch_repository: Arc::new(aionui_db::fork_extensions::SqliteExternalDispatchRepository::new(
+            services.database.pool().clone(),
+        )) as Arc<dyn aionui_db::fork_extensions::IExternalDispatchRepository>,
     }
 }
 
