@@ -1,5 +1,6 @@
 mod mcp_reload;
 mod turn_observation;
+mod workspace_rebind;
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -4138,6 +4139,17 @@ impl ConversationService {
         &self,
         request: ConversationAgentTurnRequest,
     ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
+        self.run_agent_turn_in_workspace(request, None).await
+    }
+
+    /// Reserve the conversation turn before rebinding its workspace. This
+    /// prevents a user message from racing into the short interval between the
+    /// CWD change and the externally dispatched instruction.
+    pub async fn run_agent_turn_in_workspace(
+        &self,
+        request: ConversationAgentTurnRequest,
+        workspace_rebind: Option<&str>,
+    ) -> Result<ConversationAgentTurnOutcome, ConversationError> {
         if request.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Agent turn content must not be empty".into(),
@@ -4156,6 +4168,10 @@ impl ConversationService {
 
         let turn_id = Self::mint_turn_id();
         let turn_claim = self.runtime_state.try_claim_turn(&request.conversation_id, &turn_id)?;
+        if let Some(workspace) = workspace_rebind {
+            self.rebind_workspace_after_turn_claim(&request.user_id, &request.conversation_id, workspace)
+                .await?;
+        }
         if request.persist_user_message {
             let user_msg_id = Self::mint_msg_id();
             let user_msg = aionui_db::models::MessageRow {

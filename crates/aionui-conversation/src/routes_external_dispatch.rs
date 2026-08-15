@@ -2,7 +2,10 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{ApiResponse, ExternalConversationDispatchRequest, ExternalConversationDispatchResponse};
+use aionui_api_types::{
+    ApiResponse, ExternalConversationDispatchCapabilities, ExternalConversationDispatchRequest,
+    ExternalConversationDispatchResponse,
+};
 use aionui_common::ApiError;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
@@ -27,11 +30,24 @@ pub fn external_conversation_dispatch_routes(state: ConversationRouterState) -> 
     Router::new()
         .route("/api/internal/external-conversation-dispatches", post(dispatch))
         .route(
+            "/api/internal/external-conversation-dispatches/capabilities",
+            get(dispatch_capabilities),
+        )
+        .route(
             "/api/internal/external-conversation-dispatches/{operation_id}",
             get(dispatch_status),
         )
         .layer(DefaultBodyLimit::max(EXTERNAL_DISPATCH_BODY_LIMIT))
         .with_state(state)
+}
+
+async fn dispatch_capabilities() -> Json<ApiResponse<ExternalConversationDispatchCapabilities>> {
+    Json(ApiResponse::ok(ExternalConversationDispatchCapabilities {
+        schema_version: 1,
+        workspace_lease_version: 1,
+        atomic_workspace_rebind: true,
+        releases_runtime_on_terminal: true,
+    }))
 }
 
 async fn dispatch(
