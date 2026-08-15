@@ -9,4 +9,5 @@ pub struct ConversationRouterState {
     pub service: ConversationService,
     pub task_manager: Arc<dyn IWorkerTaskManager>,
     pub active_leases: Arc<ActiveLeaseRegistry>,
+    pub external_dispatch_repository: Arc<dyn aionui_db::fork_extensions::IExternalDispatchRepository>,
 }

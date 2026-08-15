@@ -10,8 +10,12 @@ use aionui_api_types::{
     ExternalConversationDispatchResource, ExternalConversationDispatchResponse, ExternalConversationDispatchState,
     ExternalConversationDispatchStrategy, ExternalConversationDispatchWorkspaceLease,
 };
+use aionui_db::DbError;
+use aionui_db::fork_extensions::{ExternalDispatchRecord, IExternalDispatchRepository};
 use serde_json::{Value, json};
-use tracing::info;
+use sha2::{Digest, Sha256};
+use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::error::ConversationError;
 use crate::service::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService};
@@ -43,27 +47,36 @@ pub enum ExternalConversationDispatchError {
     #[error("too many external conversation dispatches are tracked")]
     CapacityExhausted,
     #[error(transparent)]
+    Persistence(#[from] DbError),
+    #[error(transparent)]
     Conversation(#[from] ConversationError),
 }
 
 #[derive(Clone)]
 struct StoredDispatch {
-    request: ExternalConversationDispatchRequest,
-    response: Option<ExternalConversationDispatchResponse>,
+    request_fingerprint: String,
+    actor_conversation_id: String,
+    workspace_lease_json: Option<String>,
+    response: ExternalConversationDispatchResponse,
     created_at: Instant,
+    created_at_ms: i64,
 }
 
 #[derive(Clone)]
 pub struct ExternalConversationDispatchService {
     conversation_service: ConversationService,
+    repository: Arc<dyn IExternalDispatchRepository>,
     dispatches: Arc<Mutex<HashMap<String, StoredDispatch>>>,
+    boot_id: Arc<str>,
 }
 
 impl ExternalConversationDispatchService {
-    pub fn new(conversation_service: ConversationService) -> Self {
+    pub fn new(conversation_service: ConversationService, repository: Arc<dyn IExternalDispatchRepository>) -> Self {
         Self {
             conversation_service,
+            repository,
             dispatches: Arc::new(Mutex::new(HashMap::new())),
+            boot_id: Uuid::now_v7().to_string().into(),
         }
     }
 
@@ -72,42 +85,71 @@ impl ExternalConversationDispatchService {
         request: ExternalConversationDispatchRequest,
     ) -> Result<ExternalConversationDispatchResponse, ExternalConversationDispatchError> {
         validate_request(&request)?;
+        let request_fingerprint = request_fingerprint(&request)?;
 
         {
             let mut dispatches = self.dispatches.lock().expect("external dispatch lock poisoned");
             dispatches.retain(|_, stored| {
-                let terminal = stored.response.as_ref().is_some_and(|response| {
-                    matches!(
-                        response.state,
-                        ExternalConversationDispatchState::Completed | ExternalConversationDispatchState::Failed
-                    )
-                });
+                let terminal = is_terminal(stored.response.state);
                 !terminal || stored.created_at.elapsed() < COMPLETED_OPERATION_TTL
             });
             if let Some(stored) = dispatches.get(&request.operation_id) {
-                if stored.request != request {
+                if stored.request_fingerprint != request_fingerprint {
                     return Err(ExternalConversationDispatchError::IdempotencyConflict);
                 }
-                return stored
-                    .response
-                    .clone()
-                    .map(|mut response| {
-                        response.repeated = true;
-                        response
-                    })
-                    .ok_or(ExternalConversationDispatchError::PreparationInProgress);
+                let mut response = stored.response.clone();
+                response.repeated = true;
+                return Ok(response);
             }
             if dispatches.len() >= MAX_TRACKED_OPERATIONS {
                 return Err(ExternalConversationDispatchError::CapacityExhausted);
             }
-            dispatches.insert(
-                request.operation_id.clone(),
-                StoredDispatch {
-                    request: request.clone(),
-                    response: None,
-                    created_at: Instant::now(),
-                },
-            );
+        }
+
+        if let Some(record) = self.repository.get(&request.operation_id).await? {
+            return repeated_persisted_response(record, &request_fingerprint, &self.repository, &self.boot_id).await;
+        }
+
+        let now = aionui_common::now_ms();
+        let placeholder = ExternalConversationDispatchResponse {
+            operation_id: request.operation_id.clone(),
+            conversation_id: request.target_conversation_id.clone().unwrap_or_default(),
+            state: ExternalConversationDispatchState::Starting,
+            turn_id: None,
+            error_message: None,
+            resource: None,
+            repeated: false,
+        };
+        let stored = StoredDispatch {
+            request_fingerprint: request_fingerprint.clone(),
+            actor_conversation_id: request.actor_conversation_id.clone(),
+            workspace_lease_json: request
+                .workspace_lease
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|_| ExternalConversationDispatchError::InvalidPayload)?,
+            response: placeholder,
+            created_at: Instant::now(),
+            created_at_ms: now,
+        };
+        let record = persisted_record(&request.operation_id, &stored, &self.boot_id, now)?;
+        if !self.repository.insert(&record).await? {
+            let existing = self
+                .repository
+                .get(&request.operation_id)
+                .await?
+                .ok_or(ExternalConversationDispatchError::PreparationInProgress)?;
+            return repeated_persisted_response(existing, &request_fingerprint, &self.repository, &self.boot_id).await;
+        }
+        self.dispatches
+            .lock()
+            .expect("external dispatch lock poisoned")
+            .insert(request.operation_id.clone(), stored);
+
+        let cutoff = now - COMPLETED_OPERATION_TTL.as_millis() as i64;
+        if let Err(error) = self.repository.delete_terminal_before(cutoff).await {
+            warn!(error = %error, "failed to prune completed external conversation dispatch records");
         }
 
         let prepared = self.prepare_dispatch(&request).await;
@@ -118,6 +160,9 @@ impl ExternalConversationDispatchService {
                     .lock()
                     .expect("external dispatch lock poisoned")
                     .remove(&request.operation_id);
+                if let Err(delete_error) = self.repository.delete(&request.operation_id).await {
+                    warn!(operation_id = %request.operation_id, error = %delete_error, "failed to remove rejected external dispatch record");
+                }
                 return Err(error);
             }
         };
@@ -131,7 +176,14 @@ impl ExternalConversationDispatchService {
             resource: None,
             repeated: false,
         };
-        self.set_response(&request.operation_id, response.clone());
+        if let Err(error) = self.set_response(&request.operation_id, response.clone()).await {
+            self.dispatches
+                .lock()
+                .expect("external dispatch lock poisoned")
+                .remove(&request.operation_id);
+            warn!(operation_id = %request.operation_id, error = %error, "external dispatch was prepared but its target could not be persisted; automatic retry is disabled");
+            return Err(error);
+        }
 
         let service = self.clone();
         let operation_id = request.operation_id.clone();
@@ -161,31 +213,35 @@ impl ExternalConversationDispatchService {
                             let waiting_service = waiting_service.clone();
                             let operation_id = waiting_operation_id.clone();
                             Box::pin(async move {
-                                waiting_service.update_response(&operation_id, |response| {
-                                    response.state = ExternalConversationDispatchState::WaitingResource;
-                                    response.turn_id = Some(waiting.turn_id);
-                                    response.resource = Some(ExternalConversationDispatchResource {
-                                        kind: "unity_project".to_owned(),
-                                        key: waiting.resource.key,
-                                        project_root: waiting.resource.project_root,
-                                    });
-                                });
+                                waiting_service
+                                    .update_response(&operation_id, |response| {
+                                        response.state = ExternalConversationDispatchState::WaitingResource;
+                                        response.turn_id = Some(waiting.turn_id);
+                                        response.resource = Some(ExternalConversationDispatchResource {
+                                            kind: "unity_project".to_owned(),
+                                            key: waiting.resource.key,
+                                            project_root: waiting.resource.project_root,
+                                        });
+                                    })
+                                    .await;
                             })
                         })),
                         on_started: Some(Arc::new(move |started| {
                             let started_service = started_service.clone();
                             let operation_id = started_operation_id.clone();
                             Box::pin(async move {
-                                started_service.update_response(&operation_id, |response| {
-                                    response.state = ExternalConversationDispatchState::Running;
-                                    response.turn_id = Some(started.turn_id);
-                                    response.resource =
-                                        started.resource.map(|resource| ExternalConversationDispatchResource {
-                                            kind: "unity_project".to_owned(),
-                                            key: resource.key,
-                                            project_root: resource.project_root,
-                                        });
-                                });
+                                started_service
+                                    .update_response(&operation_id, |response| {
+                                        response.state = ExternalConversationDispatchState::Running;
+                                        response.turn_id = Some(started.turn_id);
+                                        response.resource =
+                                            started.resource.map(|resource| ExternalConversationDispatchResource {
+                                                kind: "unity_project".to_owned(),
+                                                key: resource.key,
+                                                project_root: resource.project_root,
+                                            });
+                                    })
+                                    .await;
                             })
                         })),
                     },
@@ -197,12 +253,14 @@ impl ExternalConversationDispatchService {
                 Ok(mut outcome) => loop {
                     if outcome.interrupted {
                         let interrupted_turn_id = outcome.turn_id.clone();
-                        service.update_response(&operation_id, |response| {
-                            response.turn_id = Some(interrupted_turn_id.clone());
-                            response.state = ExternalConversationDispatchState::WaitingResume;
-                            response.error_message = None;
-                            response.resource = None;
-                        });
+                        service
+                            .update_response(&operation_id, |response| {
+                                response.turn_id = Some(interrupted_turn_id.clone());
+                                response.state = ExternalConversationDispatchState::WaitingResume;
+                                response.error_message = None;
+                                response.resource = None;
+                            })
+                            .await;
                         info!(
                             operation_id,
                             conversation_id,
@@ -229,15 +287,17 @@ impl ExternalConversationDispatchService {
                             .release_workspace_runtime_for_external_dispatch(&conversation_id)
                             .await;
                     }
-                    service.update_response(&operation_id, |response| {
-                        response.turn_id = Some(outcome.turn_id);
-                        response.state = match outcome.status {
-                            ConversationAgentTurnStatus::Completed => ExternalConversationDispatchState::Completed,
-                            ConversationAgentTurnStatus::Failed => ExternalConversationDispatchState::Failed,
-                        };
-                        response.error_message = outcome.error_message;
-                        response.resource = None;
-                    });
+                    service
+                        .update_response(&operation_id, |response| {
+                            response.turn_id = Some(outcome.turn_id);
+                            response.state = match outcome.status {
+                                ConversationAgentTurnStatus::Completed => ExternalConversationDispatchState::Completed,
+                                ConversationAgentTurnStatus::Failed => ExternalConversationDispatchState::Failed,
+                            };
+                            response.error_message = outcome.error_message;
+                            response.resource = None;
+                        })
+                        .await;
                     break;
                 },
                 Err(error) => {
@@ -247,10 +307,12 @@ impl ExternalConversationDispatchService {
                             .release_workspace_runtime_for_external_dispatch(&conversation_id)
                             .await;
                     }
-                    service.update_response(&operation_id, |response| {
-                        response.state = ExternalConversationDispatchState::Failed;
-                        response.error_message = Some(error.to_string());
-                    });
+                    service
+                        .update_response(&operation_id, |response| {
+                            response.state = ExternalConversationDispatchState::Failed;
+                            response.error_message = Some(error.to_string());
+                        })
+                        .await;
                 }
             }
         });
@@ -258,12 +320,41 @@ impl ExternalConversationDispatchService {
         Ok(response)
     }
 
-    pub fn status(&self, operation_id: &str) -> Option<ExternalConversationDispatchResponse> {
-        self.dispatches
+    pub async fn status(
+        &self,
+        operation_id: &str,
+    ) -> Result<Option<ExternalConversationDispatchResponse>, ExternalConversationDispatchError> {
+        if let Some(response) = self
+            .dispatches
             .lock()
             .expect("external dispatch lock poisoned")
             .get(operation_id)
-            .and_then(|stored| stored.response.clone())
+            .map(|stored| stored.response.clone())
+        {
+            return Ok(Some(response));
+        }
+
+        let Some(mut record) = self.repository.get(operation_id).await? else {
+            return Ok(None);
+        };
+        let mut response = deserialize_response(&record)?;
+        if !is_terminal(response.state) && response.state != ExternalConversationDispatchState::RecoveryRequired {
+            response.state = ExternalConversationDispatchState::RecoveryRequired;
+            response.error_message = Some("interrupted_by_restart".to_owned());
+            response.resource = None;
+            record.state = state_name(response.state).to_owned();
+            record.response_json =
+                serde_json::to_string(&response).map_err(|_| ExternalConversationDispatchError::InvalidPayload)?;
+            record.boot_id = self.boot_id.to_string();
+            record.updated_at = aionui_common::now_ms();
+            self.repository.update(&record).await?;
+            warn!(
+                operation_id,
+                conversation_id = %response.conversation_id,
+                "external conversation dispatch requires explicit recovery after restart"
+            );
+        }
+        Ok(Some(response))
     }
 
     async fn prepare_dispatch(
@@ -336,28 +427,121 @@ impl ExternalConversationDispatchService {
         Ok((user_id, conversation_id))
     }
 
-    fn set_response(&self, operation_id: &str, response: ExternalConversationDispatchResponse) {
-        if let Some(stored) = self
-            .dispatches
-            .lock()
-            .expect("external dispatch lock poisoned")
-            .get_mut(operation_id)
-        {
-            stored.response = Some(response);
-        }
+    async fn set_response(
+        &self,
+        operation_id: &str,
+        response: ExternalConversationDispatchResponse,
+    ) -> Result<(), ExternalConversationDispatchError> {
+        let record = {
+            let mut dispatches = self.dispatches.lock().expect("external dispatch lock poisoned");
+            let stored = dispatches
+                .get_mut(operation_id)
+                .ok_or(ExternalConversationDispatchError::PreparationInProgress)?;
+            stored.response = response;
+            persisted_record(operation_id, stored, &self.boot_id, aionui_common::now_ms())?
+        };
+        self.repository.update(&record).await?;
+        Ok(())
     }
 
-    fn update_response(&self, operation_id: &str, update: impl FnOnce(&mut ExternalConversationDispatchResponse)) {
-        if let Some(response) = self
-            .dispatches
-            .lock()
-            .expect("external dispatch lock poisoned")
-            .get_mut(operation_id)
-            .and_then(|stored| stored.response.as_mut())
+    async fn update_response(
+        &self,
+        operation_id: &str,
+        update: impl FnOnce(&mut ExternalConversationDispatchResponse),
+    ) {
+        let record = {
+            let mut dispatches = self.dispatches.lock().expect("external dispatch lock poisoned");
+            dispatches.get_mut(operation_id).and_then(|stored| {
+                update(&mut stored.response);
+                persisted_record(operation_id, stored, &self.boot_id, aionui_common::now_ms()).ok()
+            })
+        };
+        if let Some(record) = record
+            && let Err(error) = self.repository.update(&record).await
         {
-            update(response);
+            warn!(operation_id, error = %error, "failed to persist external conversation dispatch state");
         }
     }
+}
+
+fn request_fingerprint(
+    request: &ExternalConversationDispatchRequest,
+) -> Result<String, ExternalConversationDispatchError> {
+    let serialized = serde_json::to_vec(request).map_err(|_| ExternalConversationDispatchError::InvalidPayload)?;
+    Ok(format!("{:x}", Sha256::digest(serialized)))
+}
+
+fn is_terminal(state: ExternalConversationDispatchState) -> bool {
+    matches!(
+        state,
+        ExternalConversationDispatchState::Completed | ExternalConversationDispatchState::Failed
+    )
+}
+
+fn state_name(state: ExternalConversationDispatchState) -> &'static str {
+    match state {
+        ExternalConversationDispatchState::Starting => "starting",
+        ExternalConversationDispatchState::WaitingResource => "waiting_resource",
+        ExternalConversationDispatchState::Running => "running",
+        ExternalConversationDispatchState::WaitingResume => "waiting_resume",
+        ExternalConversationDispatchState::RecoveryRequired => "recovery_required",
+        ExternalConversationDispatchState::Completed => "completed",
+        ExternalConversationDispatchState::Failed => "failed",
+    }
+}
+
+fn persisted_record(
+    operation_id: &str,
+    stored: &StoredDispatch,
+    boot_id: &str,
+    updated_at: i64,
+) -> Result<ExternalDispatchRecord, ExternalConversationDispatchError> {
+    Ok(ExternalDispatchRecord {
+        operation_id: operation_id.to_owned(),
+        request_fingerprint: stored.request_fingerprint.clone(),
+        actor_conversation_id: stored.actor_conversation_id.clone(),
+        target_conversation_id: (!stored.response.conversation_id.is_empty())
+            .then(|| stored.response.conversation_id.clone()),
+        state: state_name(stored.response.state).to_owned(),
+        response_json: serde_json::to_string(&stored.response)
+            .map_err(|_| ExternalConversationDispatchError::InvalidPayload)?,
+        workspace_lease_json: stored.workspace_lease_json.clone(),
+        boot_id: boot_id.to_owned(),
+        created_at: stored.created_at_ms,
+        updated_at,
+        terminal_at: is_terminal(stored.response.state).then_some(updated_at),
+    })
+}
+
+fn deserialize_response(
+    record: &ExternalDispatchRecord,
+) -> Result<ExternalConversationDispatchResponse, ExternalConversationDispatchError> {
+    serde_json::from_str(&record.response_json).map_err(|_| ExternalConversationDispatchError::InvalidPayload)
+}
+
+async fn repeated_persisted_response(
+    mut record: ExternalDispatchRecord,
+    request_fingerprint: &str,
+    repository: &Arc<dyn IExternalDispatchRepository>,
+    boot_id: &str,
+) -> Result<ExternalConversationDispatchResponse, ExternalConversationDispatchError> {
+    if record.request_fingerprint != request_fingerprint {
+        return Err(ExternalConversationDispatchError::IdempotencyConflict);
+    }
+    let mut response = deserialize_response(&record)?;
+    if !is_terminal(response.state) {
+        response.state = ExternalConversationDispatchState::RecoveryRequired;
+        response.error_message = Some("interrupted_by_restart".to_owned());
+        response.resource = None;
+        record.state = state_name(response.state).to_owned();
+        record.response_json =
+            serde_json::to_string(&response).map_err(|_| ExternalConversationDispatchError::InvalidPayload)?;
+        record.boot_id = boot_id.to_owned();
+        record.updated_at = aionui_common::now_ms();
+        repository.update(&record).await?;
+    }
+    response.repeated = true;
+    Ok(response)
 }
 
 fn create_conversation_request(options: &ExternalConversationDispatchCreateOptions) -> CreateConversationRequest {
@@ -499,6 +683,8 @@ fn valid_list(values: &Option<Vec<String>>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_db::fork_extensions::{IExternalDispatchRepository, SqliteExternalDispatchRepository};
+    use aionui_db::init_database_memory;
 
     fn request(strategy: ExternalConversationDispatchStrategy) -> ExternalConversationDispatchRequest {
         ExternalConversationDispatchRequest {
@@ -640,5 +826,53 @@ mod tests {
             validate_request(&valid),
             Err(ExternalConversationDispatchError::InvalidPayload)
         ));
+    }
+
+    #[tokio::test]
+    async fn persisted_nonterminal_dispatch_requires_explicit_recovery_after_restart() {
+        let db = init_database_memory().await.unwrap();
+        let repository: Arc<dyn IExternalDispatchRepository> =
+            Arc::new(SqliteExternalDispatchRepository::new(db.pool().clone()));
+        let request = request(ExternalConversationDispatchStrategy::Resume);
+        let fingerprint = request_fingerprint(&request).unwrap();
+        let response = ExternalConversationDispatchResponse {
+            operation_id: request.operation_id.clone(),
+            conversation_id: "target-1".to_owned(),
+            state: ExternalConversationDispatchState::Running,
+            turn_id: Some("turn-before-restart".to_owned()),
+            error_message: None,
+            resource: None,
+            repeated: false,
+        };
+        let record = ExternalDispatchRecord {
+            operation_id: request.operation_id.clone(),
+            request_fingerprint: fingerprint.clone(),
+            actor_conversation_id: request.actor_conversation_id.clone(),
+            target_conversation_id: Some("target-1".to_owned()),
+            state: "running".to_owned(),
+            response_json: serde_json::to_string(&response).unwrap(),
+            workspace_lease_json: None,
+            boot_id: "boot-before-restart".to_owned(),
+            created_at: 1,
+            updated_at: 1,
+            terminal_at: None,
+        };
+        assert!(repository.insert(&record).await.unwrap());
+
+        let recovered = repeated_persisted_response(
+            repository.get(&request.operation_id).await.unwrap().unwrap(),
+            &fingerprint,
+            &repository,
+            "boot-after-restart",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(recovered.state, ExternalConversationDispatchState::RecoveryRequired);
+        assert_eq!(recovered.error_message.as_deref(), Some("interrupted_by_restart"));
+        assert!(recovered.repeated);
+        let persisted = repository.get(&request.operation_id).await.unwrap().unwrap();
+        assert_eq!(persisted.state, "recovery_required");
+        assert_eq!(persisted.boot_id, "boot-after-restart");
     }
 }
