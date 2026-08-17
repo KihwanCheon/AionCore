@@ -56,6 +56,7 @@ pub(crate) enum ConversationTurnStatus {
 pub(crate) struct ConversationTurnResult {
     pub status: ConversationTurnStatus,
     pub error_message: Option<String>,
+    pub resume_required: bool,
 }
 
 pub(crate) struct ConversationTurnOrchestrator {
@@ -174,6 +175,7 @@ impl ConversationTurnOrchestrator {
                 return Err(ConversationTurnResult {
                     status: ConversationTurnStatus::Failed,
                     error_message: Some(failure_message),
+                    resume_required: false,
                 });
             }
         };
@@ -210,6 +212,7 @@ impl ConversationTurnOrchestrator {
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Failed,
                 error_message: Some(failure_message),
+                resume_required: false,
             });
         }
 
@@ -266,6 +269,7 @@ impl ConversationTurnOrchestrator {
             return Err(ConversationTurnResult {
                 status: ConversationTurnStatus::Interrupted,
                 error_message: None,
+                resume_required: false,
             });
         }
 
@@ -362,6 +366,7 @@ impl ConversationTurnOrchestrator {
                         return Err(ConversationTurnResult {
                             status: ConversationTurnStatus::Failed,
                             error_message: Some(failure_message),
+                            resume_required: false,
                         });
                     }
                 }
@@ -478,6 +483,7 @@ impl ConversationTurnOrchestrator {
         let mut replay_started_at = None;
         let mut final_error_message;
         let mut auth_failure = false;
+        let mut resume_required = false;
 
         // A cancel can arrive while the background turn is being prepared.
         // Recheck immediately before starting the agent.
@@ -496,6 +502,7 @@ impl ConversationTurnOrchestrator {
             return ConversationTurnResult {
                 status: ConversationTurnStatus::Interrupted,
                 error_message: None,
+                resume_required: false,
             };
         }
 
@@ -616,6 +623,8 @@ impl ConversationTurnOrchestrator {
                     continue;
                 }
                 TurnRecoveryDecision::None => {
+                    resume_required =
+                        ConversationService::external_dispatch_requires_manual_resume(&attempt_result.outcome);
                     if attempt_result.outcome.attempt.terminal_error_deferred
                         && let Some(data) = attempt_result.outcome.attempt.terminal_error.clone()
                     {
@@ -686,10 +695,19 @@ impl ConversationTurnOrchestrator {
             ConversationTurnStatus::Completed
         };
         let error_message = if final_failed { final_error_message } else { None };
-        self.service
-            .record_agent_turn_terminal(&conv_id, &turn_id, status, error_message.clone());
+        self.service.record_agent_turn_terminal_with_resume(
+            &conv_id,
+            &turn_id,
+            status,
+            error_message.clone(),
+            resume_required,
+        );
 
-        ConversationTurnResult { status, error_message }
+        ConversationTurnResult {
+            status,
+            error_message,
+            resume_required,
+        }
     }
 }
 

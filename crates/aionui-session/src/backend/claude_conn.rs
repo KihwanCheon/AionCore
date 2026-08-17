@@ -13,6 +13,8 @@
 //! stdin + flush, bumps `turn_gen`, and synthesizes `PromptAccepted`
 //! (Synthesized — claude has no native prompt-ack wire signal).
 
+mod fork_extensions;
+
 use std::sync::Arc;
 
 use aionui_process::Spawner;
@@ -2000,8 +2002,10 @@ async fn reader_task(
                 _ = first_frame_watch_start.notified() => continue,
             }
         } else {
-            // First prompt delivered: bound the FIRST frame by the handshake budget.
-            let budget = super::handshake_budget();
+            // First prompt delivered: bound the FIRST frame by Claude's startup
+            // budget. This is intentionally longer than the shared handshake
+            // budget while leaving the post-first-frame read unbounded.
+            let budget = fork_extensions::first_frame_budget();
             match tokio::time::timeout(budget, stdout.read(&mut chunk)).await {
                 Ok(r) => r.map_err(|_| ()),
                 Err(_) => {

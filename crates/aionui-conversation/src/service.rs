@@ -410,6 +410,7 @@ pub struct ConversationAgentTurnOutcome {
     pub turn_id: String,
     pub status: ConversationAgentTurnStatus,
     pub interrupted: bool,
+    pub resume_required: bool,
     pub error_message: Option<String>,
     pub runtime: ConversationRuntimeSummary,
 }
@@ -4241,6 +4242,7 @@ impl ConversationService {
                     turn_id: turn_id.clone(),
                     status: ConversationAgentTurnStatus::Failed,
                     interrupted: false,
+                    resume_required: false,
                     error_message: Some(send_error_display_message(&send_error)),
                     runtime: self.runtime_summary_for(&request.conversation_id).await,
                 };
@@ -4285,6 +4287,7 @@ impl ConversationService {
                 ConversationTurnStatus::Failed => ConversationAgentTurnStatus::Failed,
             },
             interrupted: result.status == ConversationTurnStatus::Interrupted,
+            resume_required: result.resume_required,
             error_message: result.error_message,
         };
         Ok(outcome)
