@@ -18,7 +18,9 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::error::ConversationError;
-use crate::service::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService};
+use crate::service::{
+    ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStatus, ConversationService,
+};
 
 const MAX_OPERATION_ID_CHARS: usize = 128;
 const MAX_CONVERSATION_ID_CHARS: usize = 120;
@@ -115,6 +117,7 @@ impl ExternalConversationDispatchService {
             operation_id: request.operation_id.clone(),
             conversation_id: request.target_conversation_id.clone().unwrap_or_default(),
             state: ExternalConversationDispatchState::Starting,
+            workspace_lease: request.workspace_lease.clone(),
             turn_id: None,
             error_message: None,
             resource: None,
@@ -171,6 +174,7 @@ impl ExternalConversationDispatchService {
             operation_id: request.operation_id.clone(),
             conversation_id: conversation_id.clone(),
             state: ExternalConversationDispatchState::Starting,
+            workspace_lease: request.workspace_lease.clone(),
             turn_id: None,
             error_message: None,
             resource: None,
@@ -251,13 +255,17 @@ impl ExternalConversationDispatchService {
 
             match outcome {
                 Ok(mut outcome) => loop {
-                    if outcome.interrupted {
+                    if external_dispatch_waits_for_follow_up(&outcome) {
                         let interrupted_turn_id = outcome.turn_id.clone();
                         service
                             .update_response(&operation_id, |response| {
                                 response.turn_id = Some(interrupted_turn_id.clone());
                                 response.state = ExternalConversationDispatchState::WaitingResume;
-                                response.error_message = None;
+                                response.error_message = outcome.resume_required.then(|| {
+                                    outcome.error_message.clone().unwrap_or_else(|| {
+                                        "Agent connection was interrupted; waiting for a resumed turn".to_owned()
+                                    })
+                                });
                                 response.resource = None;
                             })
                             .await;
@@ -265,6 +273,8 @@ impl ExternalConversationDispatchService {
                             operation_id,
                             conversation_id,
                             turn_id = %interrupted_turn_id,
+                            interrupted = outcome.interrupted,
+                            resume_required = outcome.resume_required,
                             "external conversation dispatch waiting for a resumed turn"
                         );
                         outcome = service
@@ -516,7 +526,21 @@ fn persisted_record(
 fn deserialize_response(
     record: &ExternalDispatchRecord,
 ) -> Result<ExternalConversationDispatchResponse, ExternalConversationDispatchError> {
-    serde_json::from_str(&record.response_json).map_err(|_| ExternalConversationDispatchError::InvalidPayload)
+    let mut response: ExternalConversationDispatchResponse =
+        serde_json::from_str(&record.response_json).map_err(|_| ExternalConversationDispatchError::InvalidPayload)?;
+    if response.workspace_lease.is_none()
+        && let Some(workspace_lease_json) = record.workspace_lease_json.as_deref()
+    {
+        response.workspace_lease = Some(
+            serde_json::from_str(workspace_lease_json)
+                .map_err(|_| ExternalConversationDispatchError::InvalidPayload)?,
+        );
+    }
+    Ok(response)
+}
+
+fn external_dispatch_waits_for_follow_up(outcome: &ConversationAgentTurnOutcome) -> bool {
+    outcome.interrupted || outcome.resume_required
 }
 
 async fn repeated_persisted_response(
@@ -686,6 +710,34 @@ mod tests {
     use aionui_db::fork_extensions::{IExternalDispatchRepository, SqliteExternalDispatchRepository};
     use aionui_db::init_database_memory;
 
+    #[test]
+    fn retryable_disconnect_keeps_external_dispatch_waiting_for_follow_up() {
+        let outcome = ConversationAgentTurnOutcome {
+            conversation_id: "conversation-1".to_owned(),
+            turn_id: "turn-disconnected".to_owned(),
+            status: ConversationAgentTurnStatus::Failed,
+            interrupted: false,
+            resume_required: true,
+            error_message: Some("Agent process disconnected".to_owned()),
+            runtime: aionui_api_types::ConversationRuntimeSummary {
+                state: aionui_api_types::ConversationRuntimeStateKind::Idle,
+                can_send_message: true,
+                has_task: false,
+                task_status: None,
+                is_processing: false,
+                pending_confirmations: 0,
+                turn_id: None,
+                supports_midturn_delivery: false,
+            },
+        };
+
+        assert!(external_dispatch_waits_for_follow_up(&outcome));
+        assert!(!external_dispatch_waits_for_follow_up(&ConversationAgentTurnOutcome {
+            resume_required: false,
+            ..outcome
+        }));
+    }
+
     fn request(strategy: ExternalConversationDispatchStrategy) -> ExternalConversationDispatchRequest {
         ExternalConversationDispatchRequest {
             operation_id: "operation-1".to_owned(),
@@ -833,12 +885,20 @@ mod tests {
         let db = init_database_memory().await.unwrap();
         let repository: Arc<dyn IExternalDispatchRepository> =
             Arc::new(SqliteExternalDispatchRepository::new(db.pool().clone()));
-        let request = request(ExternalConversationDispatchStrategy::Resume);
+        let mut request = request(ExternalConversationDispatchStrategy::Resume);
+        let workspace_lease = ExternalConversationDispatchWorkspaceLease {
+            workspace_id: "fork2".to_owned(),
+            job_id: "job-before-restart".to_owned(),
+            lease_id: "lease-before-restart".to_owned(),
+            project_root: "C:/Git/Holdem_Fork2/hdtf-client".to_owned(),
+        };
+        request.workspace_lease = Some(workspace_lease.clone());
         let fingerprint = request_fingerprint(&request).unwrap();
         let response = ExternalConversationDispatchResponse {
             operation_id: request.operation_id.clone(),
             conversation_id: "target-1".to_owned(),
             state: ExternalConversationDispatchState::Running,
+            workspace_lease: None,
             turn_id: Some("turn-before-restart".to_owned()),
             error_message: None,
             resource: None,
@@ -851,7 +911,7 @@ mod tests {
             target_conversation_id: Some("target-1".to_owned()),
             state: "running".to_owned(),
             response_json: serde_json::to_string(&response).unwrap(),
-            workspace_lease_json: None,
+            workspace_lease_json: Some(serde_json::to_string(&workspace_lease).unwrap()),
             boot_id: "boot-before-restart".to_owned(),
             created_at: 1,
             updated_at: 1,
@@ -870,6 +930,7 @@ mod tests {
 
         assert_eq!(recovered.state, ExternalConversationDispatchState::RecoveryRequired);
         assert_eq!(recovered.error_message.as_deref(), Some("interrupted_by_restart"));
+        assert_eq!(recovered.workspace_lease.as_ref(), Some(&workspace_lease));
         assert!(recovered.repeated);
         let persisted = repository.get(&request.operation_id).await.unwrap().unwrap();
         assert_eq!(persisted.state, "recovery_required");

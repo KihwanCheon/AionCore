@@ -92,6 +92,8 @@ pub struct ExternalConversationDispatchResponse {
     pub conversation_id: String,
     pub state: ExternalConversationDispatchState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_lease: Option<ExternalConversationDispatchWorkspaceLease>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_message: Option<String>,
@@ -147,13 +149,13 @@ mod tests {
     fn capabilities_publish_workspace_lease_contract() {
         let value = serde_json::to_value(ExternalConversationDispatchCapabilities {
             schema_version: 1,
-            workspace_lease_version: 1,
+            workspace_lease_version: 2,
             atomic_workspace_rebind: true,
             releases_runtime_on_terminal: true,
             persistent_recovery_state: true,
         })
         .unwrap();
-        assert_eq!(value["workspaceLeaseVersion"], 1);
+        assert_eq!(value["workspaceLeaseVersion"], 2);
         assert_eq!(value["atomicWorkspaceRebind"], true);
     }
 
@@ -163,6 +165,7 @@ mod tests {
             operation_id: "operation-1".to_owned(),
             conversation_id: "target-1".to_owned(),
             state: ExternalConversationDispatchState::Starting,
+            workspace_lease: None,
             turn_id: None,
             error_message: None,
             resource: None,
@@ -182,6 +185,12 @@ mod tests {
             operation_id: "operation-2".to_owned(),
             conversation_id: "target-2".to_owned(),
             state: ExternalConversationDispatchState::WaitingResource,
+            workspace_lease: Some(ExternalConversationDispatchWorkspaceLease {
+                workspace_id: "fork2".to_owned(),
+                job_id: "job-12".to_owned(),
+                lease_id: "lease-opaque".to_owned(),
+                project_root: "C:/Git/Holdem_Fork2/hdtf-client".to_owned(),
+            }),
             turn_id: Some("turn-2".to_owned()),
             error_message: None,
             resource: Some(ExternalConversationDispatchResource {
@@ -196,6 +205,7 @@ mod tests {
         assert_eq!(value["state"], "waiting_resource");
         assert_eq!(value["resource"]["kind"], "unity_project");
         assert_eq!(value["resource"]["key"], "unity:abc123");
+        assert_eq!(value["workspaceLease"]["leaseId"], "lease-opaque");
     }
 
     #[test]
@@ -204,6 +214,7 @@ mod tests {
             operation_id: "operation-3".to_owned(),
             conversation_id: "target-3".to_owned(),
             state: ExternalConversationDispatchState::WaitingResume,
+            workspace_lease: None,
             turn_id: Some("turn-interrupted".to_owned()),
             error_message: None,
             resource: None,
@@ -220,6 +231,7 @@ mod tests {
             operation_id: "operation-4".to_owned(),
             conversation_id: "target-4".to_owned(),
             state: ExternalConversationDispatchState::RecoveryRequired,
+            workspace_lease: None,
             turn_id: None,
             error_message: Some("interrupted_by_restart".to_owned()),
             resource: None,
