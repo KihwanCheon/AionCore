@@ -652,7 +652,7 @@ impl AcpAgentManager {
         // This channel is separate from event_tx so the tracker never re-applies
         // events that were broadcast for the UI (e.g. from emit_snapshot_events).
         let (domain_event_tx, domain_event_rx) = mpsc::channel(256);
-        let runtime = AgentRuntime::new(params.conversation_id.clone(), params.workspace.path.clone(), 256);
+        let runtime = AgentRuntime::new(params.conversation_id.clone(), params.workspace.path.clone(), 1024);
 
         let startup = spawn_and_connect_acp(&params, &runtime).await?;
         let AcpStartupConnection {

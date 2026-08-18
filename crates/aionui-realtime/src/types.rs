@@ -155,7 +155,7 @@ pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Bounded capacity of the per-connection outbound message channel.
-pub const PER_CONNECTION_BUFFER: usize = 64;
+pub const PER_CONNECTION_BUFFER: usize = 1024;
 
 #[cfg(test)]
 mod tests {
@@ -208,7 +208,7 @@ mod tests {
     fn constants() {
         assert_eq!(HEARTBEAT_INTERVAL, Duration::from_secs(30));
         assert_eq!(HEARTBEAT_TIMEOUT, Duration::from_secs(60));
-        assert_eq!(PER_CONNECTION_BUFFER, 64);
+        assert_eq!(PER_CONNECTION_BUFFER, 1024);
     }
 
     #[test]
