@@ -3,8 +3,9 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, ExternalConversationDispatchCapabilities, ExternalConversationDispatchRequest,
-    ExternalConversationDispatchResponse,
+    ApiResponse, ConfirmExternalConversationDispatchCompletionRequest,
+    ConfirmExternalConversationDispatchCompletionResponse, ExternalConversationDispatchCapabilities,
+    ExternalConversationDispatchRequest, ExternalConversationDispatchResponse,
 };
 use aionui_common::ApiError;
 use axum::Router;
@@ -40,18 +41,37 @@ pub fn external_conversation_dispatch_routes(state: ConversationRouterState) -> 
             "/api/internal/external-conversation-dispatches/{operation_id}",
             get(dispatch_status),
         )
+        .route(
+            "/api/internal/external-conversation-dispatches/{operation_id}/complete",
+            post(confirm_dispatch_completion),
+        )
         .layer(DefaultBodyLimit::max(EXTERNAL_DISPATCH_BODY_LIMIT))
         .with_state(state)
 }
 
 async fn dispatch_capabilities() -> Json<ApiResponse<ExternalConversationDispatchCapabilities>> {
     Json(ApiResponse::ok(ExternalConversationDispatchCapabilities {
-        schema_version: 2,
+        schema_version: 3,
         workspace_lease_version: 2,
         atomic_workspace_rebind: true,
         releases_runtime_on_terminal: true,
         persistent_recovery_state: true,
+        explicit_completion_after_interruption: true,
     }))
+}
+
+async fn confirm_dispatch_completion(
+    State(state): State<ExternalConversationDispatchRouterState>,
+    Path(operation_id): Path<String>,
+    body: Result<Json<ConfirmExternalConversationDispatchCompletionRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ConfirmExternalConversationDispatchCompletionResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .confirm_completion(&operation_id, request)
+        .await
+        .map_err(map_dispatch_error)?;
+    Ok(Json(ApiResponse::ok(response)))
 }
 
 async fn dispatch(
@@ -130,6 +150,24 @@ fn map_dispatch_error(error: ExternalConversationDispatchError) -> ApiError {
             StatusCode::TOO_MANY_REQUESTS,
             "EXTERNAL_DISPATCH_CAPACITY_EXHAUSTED",
             "Too many external conversation dispatches are tracked.",
+            None,
+        ),
+        ExternalConversationDispatchError::NotFound => ApiError::coded(
+            StatusCode::NOT_FOUND,
+            "EXTERNAL_DISPATCH_NOT_FOUND",
+            "External conversation dispatch was not found.",
+            None,
+        ),
+        ExternalConversationDispatchError::CompletionNotAllowed => ApiError::coded(
+            StatusCode::CONFLICT,
+            "EXTERNAL_DISPATCH_COMPLETION_NOT_ALLOWED",
+            "The dispatch is not waiting for explicit completion.",
+            None,
+        ),
+        ExternalConversationDispatchError::CompletionTurnNotActive => ApiError::coded(
+            StatusCode::CONFLICT,
+            "EXTERNAL_DISPATCH_COMPLETION_TURN_NOT_ACTIVE",
+            "The target conversation has no active turn to confirm.",
             None,
         ),
         ExternalConversationDispatchError::Persistence(error) => ApiError::coded(

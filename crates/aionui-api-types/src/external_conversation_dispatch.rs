@@ -48,6 +48,8 @@ pub struct ExternalConversationDispatchCapabilities {
     pub atomic_workspace_rebind: bool,
     pub releases_runtime_on_terminal: bool,
     pub persistent_recovery_state: bool,
+    #[serde(default)]
+    pub explicit_completion_after_interruption: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -63,6 +65,23 @@ pub struct ExternalConversationDispatchRequest {
     pub create: Option<ExternalConversationDispatchCreateOptions>,
     #[serde(default)]
     pub workspace_lease: Option<ExternalConversationDispatchWorkspaceLease>,
+    #[serde(default)]
+    pub explicit_completion_after_interruption: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmExternalConversationDispatchCompletionRequest {
+    pub conversation_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ConfirmExternalConversationDispatchCompletionResponse {
+    pub operation_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub accepted: bool,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -121,6 +140,7 @@ mod tests {
         assert_eq!(request.strategy, ExternalConversationDispatchStrategy::Resume);
         assert_eq!(request.target_conversation_id.as_deref(), Some("target-1"));
         assert!(request.workspace_lease.is_none());
+        assert!(!request.explicit_completion_after_interruption);
     }
 
     #[test]
@@ -153,10 +173,12 @@ mod tests {
             atomic_workspace_rebind: true,
             releases_runtime_on_terminal: true,
             persistent_recovery_state: true,
+            explicit_completion_after_interruption: true,
         })
         .unwrap();
         assert_eq!(value["workspaceLeaseVersion"], 2);
         assert_eq!(value["atomicWorkspaceRebind"], true);
+        assert_eq!(value["explicitCompletionAfterInterruption"], true);
     }
 
     #[test]
