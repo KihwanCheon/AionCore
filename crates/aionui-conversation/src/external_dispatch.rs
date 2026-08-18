@@ -5,8 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aionui_api_types::{
-    AssistantConversationOverridesRequest, AssistantConversationRequest, CreateConversationRequest,
-    ExternalConversationDispatchCreateOptions, ExternalConversationDispatchRequest,
+    AssistantConversationOverridesRequest, AssistantConversationRequest,
+    ConfirmExternalConversationDispatchCompletionRequest, ConfirmExternalConversationDispatchCompletionResponse,
+    CreateConversationRequest, ExternalConversationDispatchCreateOptions, ExternalConversationDispatchRequest,
     ExternalConversationDispatchResource, ExternalConversationDispatchResponse, ExternalConversationDispatchState,
     ExternalConversationDispatchStrategy, ExternalConversationDispatchWorkspaceLease,
 };
@@ -48,6 +49,12 @@ pub enum ExternalConversationDispatchError {
     Forbidden,
     #[error("too many external conversation dispatches are tracked")]
     CapacityExhausted,
+    #[error("external conversation dispatch was not found")]
+    NotFound,
+    #[error("external conversation dispatch is not waiting for explicit completion")]
+    CompletionNotAllowed,
+    #[error("external conversation dispatch target has no active turn to confirm")]
+    CompletionTurnNotActive,
     #[error(transparent)]
     Persistence(#[from] DbError),
     #[error(transparent)]
@@ -60,6 +67,8 @@ struct StoredDispatch {
     actor_conversation_id: String,
     workspace_lease_json: Option<String>,
     response: ExternalConversationDispatchResponse,
+    explicit_completion_after_interruption: bool,
+    completion_turn_id: Option<String>,
     created_at: Instant,
     created_at_ms: i64,
 }
@@ -133,6 +142,8 @@ impl ExternalConversationDispatchService {
                 .transpose()
                 .map_err(|_| ExternalConversationDispatchError::InvalidPayload)?,
             response: placeholder,
+            explicit_completion_after_interruption: request.explicit_completion_after_interruption,
+            completion_turn_id: None,
             created_at: Instant::now(),
             created_at_ms: now,
         };
@@ -196,6 +207,7 @@ impl ExternalConversationDispatchService {
             .flatten();
         let instruction = request.instruction;
         let release_workspace_runtime = request.workspace_lease.is_some();
+        let explicit_completion_after_interruption = request.explicit_completion_after_interruption;
         tokio::spawn(async move {
             let started_service = service.clone();
             let started_operation_id = operation_id.clone();
@@ -254,62 +266,96 @@ impl ExternalConversationDispatchService {
                 .await;
 
             match outcome {
-                Ok(mut outcome) => loop {
-                    if external_dispatch_waits_for_follow_up(&outcome) {
-                        let interrupted_turn_id = outcome.turn_id.clone();
+                Ok(mut outcome) => {
+                    let mut explicit_completion_required = false;
+                    loop {
+                        if external_dispatch_waits_for_follow_up(&outcome) {
+                            if explicit_completion_after_interruption {
+                                explicit_completion_required = true;
+                                service.clear_completion_confirmation(&operation_id);
+                            }
+                            let interrupted_turn_id = outcome.turn_id.clone();
+                            service
+                                .update_response(&operation_id, |response| {
+                                    response.turn_id = Some(interrupted_turn_id.clone());
+                                    response.state = ExternalConversationDispatchState::WaitingResume;
+                                    response.error_message = outcome.resume_required.then(|| {
+                                        outcome.error_message.clone().unwrap_or_else(|| {
+                                            "Agent connection was interrupted; waiting for a resumed turn".to_owned()
+                                        })
+                                    });
+                                    response.resource = None;
+                                })
+                                .await;
+                            info!(
+                                operation_id,
+                                conversation_id,
+                                turn_id = %interrupted_turn_id,
+                                interrupted = outcome.interrupted,
+                                resume_required = outcome.resume_required,
+                                "external conversation dispatch waiting for a resumed turn"
+                            );
+                            outcome = service
+                                .conversation_service
+                                .wait_for_agent_turn_after(&conversation_id, &interrupted_turn_id)
+                                .await;
+                            info!(
+                                operation_id,
+                                conversation_id,
+                                turn_id = %outcome.turn_id,
+                                interrupted = outcome.interrupted,
+                                "external conversation dispatch observed a follow-up turn"
+                            );
+                            continue;
+                        }
+
+                        if explicit_completion_required
+                            && !service.take_completion_confirmation(&operation_id, &outcome.turn_id)
+                        {
+                            let completed_turn_id = outcome.turn_id.clone();
+                            service
+                                .update_response(&operation_id, |response| {
+                                    response.turn_id = Some(completed_turn_id.clone());
+                                    response.state = ExternalConversationDispatchState::WaitingResume;
+                                    response.error_message = Some("explicit_completion_required".to_owned());
+                                    response.resource = None;
+                                })
+                                .await;
+                            info!(
+                                operation_id,
+                                conversation_id,
+                                turn_id = %completed_turn_id,
+                                "external conversation dispatch follow-up finished without explicit completion"
+                            );
+                            outcome = service
+                                .conversation_service
+                                .wait_for_agent_turn_after(&conversation_id, &completed_turn_id)
+                                .await;
+                            continue;
+                        }
+
+                        if release_workspace_runtime {
+                            service
+                                .conversation_service
+                                .release_workspace_runtime_for_external_dispatch(&conversation_id)
+                                .await;
+                        }
                         service
                             .update_response(&operation_id, |response| {
-                                response.turn_id = Some(interrupted_turn_id.clone());
-                                response.state = ExternalConversationDispatchState::WaitingResume;
-                                response.error_message = outcome.resume_required.then(|| {
-                                    outcome.error_message.clone().unwrap_or_else(|| {
-                                        "Agent connection was interrupted; waiting for a resumed turn".to_owned()
-                                    })
-                                });
+                                response.turn_id = Some(outcome.turn_id);
+                                response.state = match outcome.status {
+                                    ConversationAgentTurnStatus::Completed => {
+                                        ExternalConversationDispatchState::Completed
+                                    }
+                                    ConversationAgentTurnStatus::Failed => ExternalConversationDispatchState::Failed,
+                                };
+                                response.error_message = outcome.error_message;
                                 response.resource = None;
                             })
                             .await;
-                        info!(
-                            operation_id,
-                            conversation_id,
-                            turn_id = %interrupted_turn_id,
-                            interrupted = outcome.interrupted,
-                            resume_required = outcome.resume_required,
-                            "external conversation dispatch waiting for a resumed turn"
-                        );
-                        outcome = service
-                            .conversation_service
-                            .wait_for_agent_turn_after(&conversation_id, &interrupted_turn_id)
-                            .await;
-                        info!(
-                            operation_id,
-                            conversation_id,
-                            turn_id = %outcome.turn_id,
-                            interrupted = outcome.interrupted,
-                            "external conversation dispatch observed a follow-up turn"
-                        );
-                        continue;
+                        break;
                     }
-
-                    if release_workspace_runtime {
-                        service
-                            .conversation_service
-                            .release_workspace_runtime_for_external_dispatch(&conversation_id)
-                            .await;
-                    }
-                    service
-                        .update_response(&operation_id, |response| {
-                            response.turn_id = Some(outcome.turn_id);
-                            response.state = match outcome.status {
-                                ConversationAgentTurnStatus::Completed => ExternalConversationDispatchState::Completed,
-                                ConversationAgentTurnStatus::Failed => ExternalConversationDispatchState::Failed,
-                            };
-                            response.error_message = outcome.error_message;
-                            response.resource = None;
-                        })
-                        .await;
-                    break;
-                },
+                }
                 Err(error) => {
                     if release_workspace_runtime {
                         service
@@ -365,6 +411,61 @@ impl ExternalConversationDispatchService {
             );
         }
         Ok(Some(response))
+    }
+
+    pub async fn confirm_completion(
+        &self,
+        operation_id: &str,
+        request: ConfirmExternalConversationDispatchCompletionRequest,
+    ) -> Result<ConfirmExternalConversationDispatchCompletionResponse, ExternalConversationDispatchError> {
+        if !valid_operation_id(operation_id) || !valid_identifier(&request.conversation_id, MAX_CONVERSATION_ID_CHARS) {
+            return Err(ExternalConversationDispatchError::InvalidPayload);
+        }
+        {
+            let dispatches = self.dispatches.lock().expect("external dispatch lock poisoned");
+            let stored = dispatches
+                .get(operation_id)
+                .ok_or(ExternalConversationDispatchError::NotFound)?;
+            validate_completion_confirmation(stored, &request.conversation_id)?;
+        }
+        let active_turn_id = self
+            .conversation_service
+            .runtime_state()
+            .active_turn_id_for(&request.conversation_id)
+            .ok_or(ExternalConversationDispatchError::CompletionTurnNotActive)?;
+        let response = {
+            let mut dispatches = self.dispatches.lock().expect("external dispatch lock poisoned");
+            let stored = dispatches
+                .get_mut(operation_id)
+                .ok_or(ExternalConversationDispatchError::NotFound)?;
+            register_completion_confirmation(stored, &request.conversation_id, &active_turn_id)?
+        };
+        info!(
+            operation_id,
+            conversation_id = %response.conversation_id,
+            turn_id = %response.turn_id,
+            "external conversation dispatch explicit completion accepted"
+        );
+        Ok(response)
+    }
+
+    fn clear_completion_confirmation(&self, operation_id: &str) {
+        if let Some(stored) = self
+            .dispatches
+            .lock()
+            .expect("external dispatch lock poisoned")
+            .get_mut(operation_id)
+        {
+            stored.completion_turn_id = None;
+        }
+    }
+
+    fn take_completion_confirmation(&self, operation_id: &str, turn_id: &str) -> bool {
+        let mut dispatches = self.dispatches.lock().expect("external dispatch lock poisoned");
+        let Some(stored) = dispatches.get_mut(operation_id) else {
+            return false;
+        };
+        consume_completion_confirmation(stored, turn_id)
     }
 
     async fn prepare_dispatch(
@@ -541,6 +642,42 @@ fn deserialize_response(
 
 fn external_dispatch_waits_for_follow_up(outcome: &ConversationAgentTurnOutcome) -> bool {
     outcome.interrupted || outcome.resume_required
+}
+
+fn validate_completion_confirmation(
+    stored: &StoredDispatch,
+    conversation_id: &str,
+) -> Result<(), ExternalConversationDispatchError> {
+    if stored.response.conversation_id != conversation_id {
+        return Err(ExternalConversationDispatchError::Forbidden);
+    }
+    if !stored.explicit_completion_after_interruption
+        || stored.response.state != ExternalConversationDispatchState::WaitingResume
+    {
+        return Err(ExternalConversationDispatchError::CompletionNotAllowed);
+    }
+    Ok(())
+}
+
+fn register_completion_confirmation(
+    stored: &mut StoredDispatch,
+    conversation_id: &str,
+    active_turn_id: &str,
+) -> Result<ConfirmExternalConversationDispatchCompletionResponse, ExternalConversationDispatchError> {
+    validate_completion_confirmation(stored, conversation_id)?;
+    stored.completion_turn_id = Some(active_turn_id.to_owned());
+    Ok(ConfirmExternalConversationDispatchCompletionResponse {
+        operation_id: stored.response.operation_id.clone(),
+        conversation_id: conversation_id.to_owned(),
+        turn_id: active_turn_id.to_owned(),
+        accepted: true,
+    })
+}
+
+fn consume_completion_confirmation(stored: &mut StoredDispatch, turn_id: &str) -> bool {
+    let confirmed = stored.completion_turn_id.as_deref() == Some(turn_id);
+    stored.completion_turn_id = None;
+    confirmed
 }
 
 async fn repeated_persisted_response(
@@ -747,7 +884,67 @@ mod tests {
             instruction: "Continue the card work".to_owned(),
             create: None,
             workspace_lease: None,
+            explicit_completion_after_interruption: false,
         }
+    }
+
+    fn stored_dispatch_for_completion() -> StoredDispatch {
+        StoredDispatch {
+            request_fingerprint: "fingerprint".to_owned(),
+            actor_conversation_id: "actor-1".to_owned(),
+            workspace_lease_json: None,
+            response: ExternalConversationDispatchResponse {
+                operation_id: "operation-1".to_owned(),
+                conversation_id: "target-1".to_owned(),
+                state: ExternalConversationDispatchState::WaitingResume,
+                workspace_lease: None,
+                turn_id: Some("turn-interrupted".to_owned()),
+                error_message: None,
+                resource: None,
+                repeated: false,
+            },
+            explicit_completion_after_interruption: true,
+            completion_turn_id: None,
+            created_at: Instant::now(),
+            created_at_ms: 1,
+        }
+    }
+
+    #[test]
+    fn completion_confirmation_binds_the_active_follow_up_turn() {
+        let mut stored = stored_dispatch_for_completion();
+
+        let response = register_completion_confirmation(&mut stored, "target-1", "turn-follow-up").unwrap();
+
+        assert_eq!(response.operation_id, "operation-1");
+        assert_eq!(response.turn_id, "turn-follow-up");
+        assert!(response.accepted);
+        assert_eq!(stored.completion_turn_id.as_deref(), Some("turn-follow-up"));
+    }
+
+    #[test]
+    fn completion_confirmation_rejects_other_conversation_or_nonwaiting_dispatch() {
+        let mut stored = stored_dispatch_for_completion();
+        assert!(matches!(
+            register_completion_confirmation(&mut stored, "target-2", "turn-follow-up"),
+            Err(ExternalConversationDispatchError::Forbidden)
+        ));
+
+        stored.response.state = ExternalConversationDispatchState::Running;
+        assert!(matches!(
+            register_completion_confirmation(&mut stored, "target-1", "turn-follow-up"),
+            Err(ExternalConversationDispatchError::CompletionNotAllowed)
+        ));
+    }
+
+    #[test]
+    fn ordinary_follow_up_cannot_consume_an_explicit_completion_confirmation() {
+        let mut stored = stored_dispatch_for_completion();
+        assert!(!consume_completion_confirmation(&mut stored, "turn-question"));
+
+        register_completion_confirmation(&mut stored, "target-1", "turn-work").unwrap();
+        assert!(!consume_completion_confirmation(&mut stored, "turn-other"));
+        assert!(stored.completion_turn_id.is_none());
     }
 
     #[test]

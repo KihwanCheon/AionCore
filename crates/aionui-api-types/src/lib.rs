@@ -125,6 +125,7 @@ pub use extension::{
     InstallExtensionRequest, PermissionDetailResponse, PermissionSummaryResponse,
 };
 pub use external_conversation_dispatch::{
+    ConfirmExternalConversationDispatchCompletionRequest, ConfirmExternalConversationDispatchCompletionResponse,
     ExternalConversationDispatchCapabilities, ExternalConversationDispatchWorkspaceLease,
 };
 pub use external_conversation_dispatch::{
