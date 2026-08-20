@@ -37,7 +37,7 @@ use aionui_common::AgentType;
 use aionui_db::{IAcpSessionRepository, IMcpServerRepository, SaveRuntimeStateParams};
 use aionui_realtime::EventBroadcaster;
 
-const EVENT_CHANNEL_CAPACITY: usize = 512;
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 // Option ids for the generic tool-approval card. `confirm()` maps the incoming
 // `data` string against these to pick the PermissionDecision; anything else is
