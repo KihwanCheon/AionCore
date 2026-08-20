@@ -47,6 +47,7 @@ use futures_util::stream::{BoxStream, StreamExt};
 const CODEX_CONFIG_FLAG: &str = "-c";
 const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all";
 const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
+const AIONUI_CONVERSATION_ID_ENV: &str = "AIONUI_CONVERSATION_ID";
 
 /// Config overrides that make Codex command-execution children inherit the
 /// runtime environment injected into the app-server process.
@@ -567,7 +568,8 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
     // NB: `config.model` is intentionally NOT written here — see the doc comment
     // above. It is applied post-discovery by `reconcile_codex_model` (validated).
     if !config.init.mcp_servers.is_empty() {
-        params["config"] = json!({ "mcp_servers": build_codex_mcp_servers(&config.init.mcp_servers) });
+        params["config"] =
+            json!({ "mcp_servers": build_codex_mcp_servers(&config.init.mcp_servers, &config.spawn_env) });
     }
     if let Some(preset) = &config.init.preset_context {
         params["developerInstructions"] = json!(preset);
@@ -630,13 +632,27 @@ enum HandshakeMode<'a> {
 /// `env` is a MAP `{KEY:VAL}` (not an array of `{name,value}`), and an HTTP server
 /// carries `{url, bearer_token_env_var}` (codex resolves the token from the env
 /// var; there is no inline-headers field). Pure `serde_json`, no codex SDK.
-fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Value {
+fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec], spawn_env: &[aionui_common::EnvVar]) -> Value {
     use crate::backend::McpTransport;
+    // Codex app-server does not forward its process environment to MCP stdio
+    // children. Carry only the non-secret conversation identity explicitly so
+    // integrations can attribute writes to the calling conversation. Runtime
+    // tokens and other AIONUI_* values stay confined to the agent process.
+    let conversation_id = spawn_env
+        .iter()
+        .rev()
+        .find(|entry| entry.name == AIONUI_CONVERSATION_ID_ENV)
+        .map(|entry| entry.value.trim())
+        .filter(|value| !value.is_empty());
     let mut map = serde_json::Map::new();
     for s in servers {
         let entry = match &s.transport {
             McpTransport::Stdio { command, args, env } => {
-                let env_map: serde_json::Map<String, Value> = env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                let mut env_map: serde_json::Map<String, Value> =
+                    env.iter().map(|(k, v)| (k.clone(), json!(v))).collect();
+                if let Some(conversation_id) = conversation_id {
+                    env_map.insert(AIONUI_CONVERSATION_ID_ENV.to_owned(), json!(conversation_id));
+                }
                 json!({ "command": command, "args": args, "env": Value::Object(env_map) })
             }
             // codex streamable-http MCP: url + (optional) bearer token env var. The
@@ -8076,6 +8092,57 @@ mod tests {
         // (replace) — see preset_context_rides_developer_instructions_not_base.
         assert_eq!(frame["params"]["developerInstructions"], "You are a helpful assistant.");
         assert!(frame["params"].get("baseInstructions").is_none());
+    }
+
+    /// Codex launches configured stdio MCP servers itself, so those children do
+    /// not inherit `CommandSpec.env` from the app-server process. Forward the
+    /// conversation identity explicitly on every thread lifecycle path while
+    /// keeping runtime credentials out of third-party MCP environments.
+    #[test]
+    fn codex_stdio_mcp_receives_only_authoritative_conversation_identity() {
+        use crate::backend::{McpServerSpec, McpTransport, SessionInit};
+        let config = SessionConfig {
+            spawn_env: vec![
+                aionui_common::EnvVar {
+                    name: "AIONUI_RUNTIME_TOKEN".into(),
+                    value: "secret-runtime-token".into(),
+                },
+                aionui_common::EnvVar {
+                    name: AIONUI_CONVERSATION_ID_ENV.into(),
+                    value: "conversation-current".into(),
+                },
+            ],
+            init: SessionInit {
+                mcp_servers: vec![McpServerSpec {
+                    name: "mindnprogress".into(),
+                    transport: McpTransport::Stdio {
+                        command: "/usr/bin/node".into(),
+                        args: vec!["mcp/server.mjs".into()],
+                        env: vec![
+                            (AIONUI_CONVERSATION_ID_ENV.into(), "conversation-stale".into()),
+                            ("MNP_API_URL".into(), "http://127.0.0.1:4176".into()),
+                        ],
+                    },
+                }],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let frames = [
+            thread_start_params(&config).into_frame(1, "thread/start"),
+            thread_resume_params(&config, "thread-1").into_frame(2, "thread/resume"),
+            thread_fork_params(&config, "thread-1", None).into_frame(3, "thread/fork"),
+        ];
+        for frame in frames {
+            let env = &frame["params"]["config"]["mcp_servers"]["mindnprogress"]["env"];
+            assert_eq!(env[AIONUI_CONVERSATION_ID_ENV], "conversation-current");
+            assert_eq!(env["MNP_API_URL"], "http://127.0.0.1:4176");
+            assert!(
+                env.get("AIONUI_RUNTIME_TOKEN").is_none(),
+                "runtime credentials must not be copied into configured MCP servers"
+            );
+        }
     }
 
     /// The assistant preset must NOT replace codex's built-in system prompt.
