@@ -22,6 +22,7 @@ use futures_util::stream::BoxStream;
 use tokio::sync::broadcast;
 
 use crate::agent_task::IAgentTask;
+use crate::capability::live_tool_output::{LIVE_TOOL_OUTPUT_PREVIEW_BYTES, LiveToolOutputBuffer};
 use crate::error::AgentError;
 use crate::protocol::events::session_updates::AvailableCommandsEventData;
 use crate::protocol::events::session_updates::ThinkingEventData;
@@ -2745,14 +2746,11 @@ fn spawn_event_pump(
     // removing it from the manager map) drops that Arc → backend `Drop` → reader
     // abort + `kill_on_drop` → `event_tx` drops → this stream Closes → the loop ends.
     tokio::spawn(async move {
-        // Per-tool accumulated live output for codex `ToolOutputDelta` (streamed
-        // command stdout). The frontend merges `tool_call` frames by call_id with a
-        // shallow REPLACE of `output` (hooks.ts: `{...existing, ...new}`), so we must
-        // send the CUMULATIVE text each time, not the delta — otherwise each chunk
-        // overwrites the last and only the final chunk shows. Keyed by item_id (==
-        // the ToolCall tool_use_id). The authoritative full output still arrives on
-        // the completed ToolResult, which harmlessly replaces this live view.
-        let mut tool_output: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Per-tool live previews for codex `ToolOutputDelta` (streamed command
+        // stdout). The frontend replaces `output` on each frame, so previews remain
+        // cumulative, but are bounded and rate-limited to keep noisy commands from
+        // flooding the renderer. The completed ToolResult remains authoritative.
+        let mut tool_output = LiveToolOutputBuffer::new();
         // In-flight workflow/subagent refs, mirroring `state::background_active`
         // (any non-terminal roster entry ⇒ in-flight). claude's non-blocking
         // Workflow turn emits MULTIPLE `result` frames: the LAUNCH result arrives
@@ -2957,20 +2955,30 @@ fn spawn_event_pump(
             if let SessionEvent::ToolOutputDelta { item_id, text } = &env.event {
                 // Streamed tool stdout is user-visible output — this turn is not blank.
                 saw_visible_output = true;
-                let acc = tool_output.entry(item_id.clone()).or_default();
-                acc.push_str(text);
-                let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
-                    call_id: item_id.clone(),
-                    // The wire delta carries no name; use the remembered one so this
-                    // live-output frame doesn't overwrite the persisted row's name to "".
-                    name: tool_name.get(item_id).cloned().unwrap_or_default(),
-                    args: serde_json::Value::Null,
-                    status: ToolCallStatus::Running,
-                    input: None,
-                    output: Some(acc.clone()),
-                    description: None,
-                    parent_call_id: None,
-                }));
+                let update = tool_output.push(item_id, text);
+                if update.truncation_started {
+                    tracing::warn!(
+                        conv_id = %conversation_id,
+                        call_id = %item_id,
+                        received_bytes = update.received_bytes,
+                        preview_limit_bytes = LIVE_TOOL_OUTPUT_PREVIEW_BYTES,
+                        "session-pump: live tool output preview truncated"
+                    );
+                }
+                if let Some(output) = update.output {
+                    let _ = runtime.tx.send(AgentStreamEvent::ToolCall(ToolCallEventData {
+                        call_id: item_id.clone(),
+                        // The wire delta carries no name; use the remembered one so this
+                        // live-output frame doesn't overwrite the persisted row's name to "".
+                        name: tool_name.get(item_id).cloned().unwrap_or_default(),
+                        args: serde_json::Value::Null,
+                        status: ToolCallStatus::Running,
+                        input: None,
+                        output: Some(output),
+                        description: None,
+                        parent_call_id: None,
+                    }));
+                }
                 continue;
             }
 
@@ -3241,6 +3249,19 @@ fn spawn_event_pump(
                 }
                 SessionEvent::ToolResult { tool_use_id, .. } => {
                     open_tools.remove(tool_use_id);
+                    if let Some(stats) = tool_output.remove(tool_use_id)
+                        && stats.truncated
+                    {
+                        tracing::info!(
+                            conv_id = %conversation_id,
+                            call_id = %tool_use_id,
+                            received_bytes = stats.received_bytes,
+                            emitted_frames = stats.emitted_frames,
+                            coalesced_frames = stats.coalesced_frames,
+                            preview_limit_bytes = LIVE_TOOL_OUTPUT_PREVIEW_BYTES,
+                            "session-pump: bounded live tool output preview completed"
+                        );
+                    }
                 }
                 SessionEvent::TurnResult { .. } | SessionEvent::Detached { .. } if !suppress_intermediate_finish => {
                     // A real (unsuppressed) terminal settles any owed launch Finish —
@@ -3346,7 +3367,7 @@ fn spawn_event_pump(
                     // still open past this turn end (detached exec): their terminal
                     // arrives minutes later and `stamp_tool_name` must still find the
                     // name, or the card re-renders nameless.
-                    tool_output.retain(|call_id, _| open_tools.contains_key(call_id));
+                    tool_output.retain(|call_id| open_tools.contains_key(call_id));
                     tool_name.retain(|call_id, _| open_tools.contains_key(call_id));
                     // Reset the per-turn visibility flag for the next turn.
                     saw_visible_output = false;
@@ -10010,12 +10031,11 @@ mod pump_tests {
         );
     }
 
-    // codex ToolOutputDelta (streamed command stdout) must surface as tool_call
-    // frames carrying the CUMULATIVE output (the frontend REPLACES output on merge,
-    // so sending raw deltas would show only the last chunk). Each frame keys on the
-    // item_id so the frontend appends to the right tool.
+    // codex ToolOutputDelta (streamed command stdout) must surface immediately as a
+    // cumulative tool_call preview. Bursts may be coalesced by the bounded preview
+    // buffer; every emitted frame still keys on item_id so it updates the right tool.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn tool_output_delta_accumulates_cumulative_output() {
+    async fn tool_output_delta_emits_first_preview_and_coalesces_burst() {
         let script = vec![
             env(SessionEvent::ToolOutputDelta {
                 item_id: "call_0".into(),
@@ -10034,8 +10054,7 @@ mod pump_tests {
                 _ => None,
             })
             .collect();
-        // Two frames: first the 1st chunk, then the cumulative 1st+2nd (not just "line-2").
-        assert_eq!(outputs, vec!["line-1\n".to_string(), "line-1\nline-2\n".to_string()]);
+        assert_eq!(outputs, vec!["line-1\n".to_string()]);
     }
 
     // ── Defect 1: process-reap on task drop ───────────────────────────────
