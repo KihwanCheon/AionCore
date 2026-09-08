@@ -10,8 +10,8 @@ use aionui_api_types::{
     ApiResponse, ClientPreferencesResponse, CreateProviderRequest, CurrentUserResponse, DetectProtocolRequest,
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, FeedbackDiagnosticsQuery, FeedbackDiagnosticsResponse,
     FetchModelsAnonymousRequest, FetchModelsRequest, FetchModelsResponse, ProtocolDetectionResponse, ProviderResponse,
-    SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult, UpdateClientPreferencesRequest,
-    UpdateProviderRequest, UpdateSettingsRequest,
+    SubscriptionUsageSnapshot, SystemInfoResponse, SystemSettingsResponse, UpdateCheckRequest, UpdateCheckResult,
+    UpdateClientPreferencesRequest, UpdateProviderRequest, UpdateSettingsRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -71,6 +71,7 @@ impl From<SystemError> for ApiError {
 /// - `POST /api/providers/detect-protocol`   — detect API protocol
 /// - `GET  /api/system/current-user`         — the identity the auth middleware injected
 /// - `GET  /api/system/info`                 — system directory & platform info
+/// - `GET  /api/system/subscription-usage`   — desktop-published AI subscription usage
 /// - `POST /api/system/check-update`         — check GitHub for new versions
 /// - `POST /api/system/ensure-node-runtime`  — prepare managed Node runtime
 /// - `GET  /api/system/diagnostics/feedback-report` — collect sanitized feedback diagnostics
@@ -91,6 +92,7 @@ pub fn system_routes(state: SystemRouterState) -> Router {
         .route("/api/providers/{id}/models", post(fetch_models))
         .route("/api/system/current-user", get(get_current_user))
         .route("/api/system/info", get(get_system_info))
+        .route("/api/system/subscription-usage", get(get_subscription_usage))
         .route("/api/system/check-update", post(check_update))
         .route("/api/system/ensure-node-runtime", post(ensure_node_runtime))
         .route("/api/system/diagnostics/feedback-report", get(get_feedback_diagnostics))
@@ -310,6 +312,10 @@ async fn get_current_user(Extension(user): Extension<CurrentUser>) -> Json<ApiRe
 async fn get_system_info() -> Json<ApiResponse<SystemInfoResponse>> {
     let info = crate::sysinfo::get_system_info();
     Json(ApiResponse::ok(info))
+}
+
+async fn get_subscription_usage() -> Json<ApiResponse<Option<SubscriptionUsageSnapshot>>> {
+    Json(ApiResponse::ok(crate::subscription_usage::read_subscription_usage()))
 }
 
 async fn check_update(

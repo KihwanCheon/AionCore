@@ -36,6 +36,7 @@ mod sidebar;
 mod skill;
 mod skill_delivery;
 mod skill_runtime;
+mod subscription_usage;
 mod system;
 mod team;
 mod team_mcp;
@@ -217,6 +218,10 @@ pub use skill_runtime::{
     RuntimeSkillFileQuery, RuntimeSkillFileResponse, RuntimeSkillListItem, RuntimeSkillListResponse,
     RuntimeSkillShowResponse, SKILL_RUNTIME_SCHEMA_VERSION, SkillRuntimeEnvelope, SkillRuntimeErrorCode,
     SkillRuntimeErrorPayload, SkillRuntimeMeta,
+};
+pub use subscription_usage::{
+    ClaudeSubscriptionUsage, CodexSubscriptionUsage, CodexSubscriptionUsageWindow, ProviderUsageState,
+    SubscriptionUsageSnapshot, SubscriptionUsageState, SubscriptionUsageWindow,
 };
 pub use system::{
     ClientPreferencesResponse, CurrentUserResponse, FeedbackDiagnosticsContextResponse,

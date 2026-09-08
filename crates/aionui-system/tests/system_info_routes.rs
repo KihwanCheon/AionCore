@@ -161,6 +161,20 @@ async fn test_system_info_snake_case_keys() {
     assert!(data.get("logDir").is_none());
 }
 
+#[tokio::test]
+async fn test_subscription_usage_returns_success_envelope() {
+    let app = setup().await;
+    let resp = app
+        .oneshot(get_request("/api/system/subscription-usage"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    assert_eq!(json["success"], true);
+    assert!(json.get("data").is_some());
+}
+
 // ===========================================================================
 // POST /api/system/check-update — with wiremock
 // ===========================================================================

@@ -98,6 +98,18 @@ async fn auth_required_system_info() {
 }
 
 #[tokio::test]
+async fn auth_required_subscription_usage() {
+    let (app, _) = build_app().await;
+    let resp = app
+        .oneshot(get_request("/api/system/subscription-usage"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = body_json(resp).await;
+    assert_eq!(json["code"], "UNAUTHORIZED");
+}
+
+#[tokio::test]
 async fn auth_required_check_update() {
     let (app, _) = build_app().await;
     let req = Request::builder()

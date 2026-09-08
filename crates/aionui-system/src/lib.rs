@@ -13,6 +13,7 @@ pub mod provider;
 pub mod routes;
 pub mod runtime_prepare;
 pub mod settings;
+mod subscription_usage;
 pub mod sysinfo;
 pub mod version;
 
