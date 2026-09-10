@@ -5,12 +5,13 @@
 //! external consumers of the library.
 
 use std::{
-    fs::{File, OpenOptions},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
 };
 
-use chrono::Datelike;
+use chrono::{Datelike, Duration, NaiveDate};
+use tracing_appender::non_blocking::NonBlockingBuilder;
 use tracing_subscriber::{EnvFilter, Layer, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 use super::{BootstrapError, BootstrapErrorCode};
@@ -44,6 +45,10 @@ const AIONRS_TARGETS: &[&str] = &[
 ];
 
 const RAW_AIONRS_PAYLOAD_TARGETS: &[&str] = &["aion_agent", "aion_providers"];
+const LOG_FILE_SIZE_LIMIT_BYTES: u64 = 10 * 1024 * 1024;
+const LOG_FILES_PER_DAY_LIMIT: u32 = 5;
+const LOG_RETENTION_DAYS: i64 = 14;
+const LOG_BUFFERED_LINES_LIMIT: usize = 8_192;
 
 fn build_env_filter(log_level: Option<&str>) -> EnvFilter {
     let user_directives = log_level.unwrap_or("info");
@@ -180,7 +185,11 @@ pub fn init_tracing(
 
     // Backend file layer — excludes aion_* targets
     let file_appender = DailyDatedLogWriter::new(log_dir.to_path_buf(), "aioncore.log");
-    let (non_blocking, backend_guard) = tracing_appender::non_blocking(file_appender);
+    let (non_blocking, backend_guard) = NonBlockingBuilder::default()
+        .buffered_lines_limit(LOG_BUFFERED_LINES_LIMIT)
+        .lossy(true)
+        .thread_name("aioncore-log-writer")
+        .finish(file_appender);
 
     let backend_file_layer = fmt::layer()
         .json()
@@ -202,7 +211,11 @@ pub fn init_tracing(
         .with_field("logDir", active_log_dir.display().to_string())
     })?;
     let aionrs_appender = DailyDatedLogWriter::new(log_dir.to_path_buf(), "aionrs.log");
-    let (aionrs_non_blocking, aionrs_guard) = tracing_appender::non_blocking(aionrs_appender);
+    let (aionrs_non_blocking, aionrs_guard) = NonBlockingBuilder::default()
+        .buffered_lines_limit(LOG_BUFFERED_LINES_LIMIT)
+        .lossy(true)
+        .thread_name("aionrs-log-writer")
+        .finish(aionrs_appender);
     let aionrs_layer = fmt::layer()
         .json()
         .with_writer(aionrs_non_blocking)
@@ -268,6 +281,18 @@ impl LogDate {
     fn file_name(self, suffix: &str) -> String {
         format!("{:04}-{:02}-{:02}.{}", self.year, self.month, self.day, suffix)
     }
+
+    fn rolled_file_name(self, part: u32, suffix: &str) -> String {
+        if part == 0 {
+            self.file_name(suffix)
+        } else {
+            format!("{:04}-{:02}-{:02}.{part}.{}", self.year, self.month, self.day, suffix)
+        }
+    }
+
+    fn naive_date(self) -> Option<NaiveDate> {
+        NaiveDate::from_ymd_opt(self.year, self.month, self.day)
+    }
 }
 
 fn dated_log_dir_for(log_root: &Path, date: LogDate) -> PathBuf {
@@ -277,15 +302,90 @@ fn dated_log_dir_for(log_root: &Path, date: LogDate) -> PathBuf {
         .join(format!("{:02}", date.day))
 }
 
-fn dated_log_file_path(log_root: &Path, date: LogDate, suffix: &str) -> PathBuf {
-    dated_log_dir_for(log_root, date).join(date.file_name(suffix))
+fn rolled_log_file_path(log_root: &Path, date: LogDate, part: u32, suffix: &str) -> PathBuf {
+    dated_log_dir_for(log_root, date).join(date.rolled_file_name(part, suffix))
+}
+
+fn parse_log_partition(year: &str, month: &str, day: &str) -> Option<NaiveDate> {
+    if year.len() != 4 || month.len() != 2 || day.len() != 2 {
+        return None;
+    }
+    NaiveDate::from_ymd_opt(year.parse().ok()?, month.parse().ok()?, day.parse().ok()?)
+}
+
+fn remove_dir_if_empty(path: &Path) {
+    if fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none()) {
+        let _ = fs::remove_dir(path);
+    }
+}
+
+fn cleanup_expired_log_partitions(log_root: &Path, today: LogDate, retention_days: i64) -> io::Result<()> {
+    let Some(today) = today.naive_date() else {
+        return Ok(());
+    };
+    let cutoff = today - Duration::days(retention_days.max(1) - 1);
+
+    for year_entry in fs::read_dir(log_root)? {
+        let year_entry = year_entry?;
+        if !year_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let year_name = year_entry.file_name();
+        let year = year_name.to_string_lossy();
+        let year_path = year_entry.path();
+
+        for month_entry in match fs::read_dir(&year_path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        } {
+            let month_entry = match month_entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            if !month_entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                continue;
+            }
+            let month_name = month_entry.file_name();
+            let month = month_name.to_string_lossy();
+            let month_path = month_entry.path();
+
+            for day_entry in match fs::read_dir(&month_path) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            } {
+                let day_entry = match day_entry {
+                    Ok(entry) => entry,
+                    Err(_) => continue,
+                };
+                if !day_entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    continue;
+                }
+                let day_name = day_entry.file_name();
+                let day = day_name.to_string_lossy();
+                if parse_log_partition(&year, &month, &day).is_some_and(|date| date < cutoff) {
+                    let _ = fs::remove_dir_all(day_entry.path());
+                }
+            }
+
+            remove_dir_if_empty(&month_path);
+        }
+
+        remove_dir_if_empty(&year_path);
+    }
+
+    Ok(())
 }
 
 struct DailyDatedLogWriter {
     log_root: PathBuf,
     filename_suffix: &'static str,
     date_provider: Box<dyn Fn() -> LogDate + Send + Sync>,
+    max_file_bytes: u64,
+    max_files_per_day: u32,
+    retention_days: i64,
     active_date: Option<LogDate>,
+    active_part: u32,
+    active_bytes: u64,
     active_file: Option<File>,
 }
 
@@ -299,35 +399,111 @@ impl DailyDatedLogWriter {
         filename_suffix: &'static str,
         date_provider: Box<dyn Fn() -> LogDate + Send + Sync>,
     ) -> Self {
+        Self::new_with_policy(
+            log_root,
+            filename_suffix,
+            date_provider,
+            LOG_FILE_SIZE_LIMIT_BYTES,
+            LOG_FILES_PER_DAY_LIMIT,
+            LOG_RETENTION_DAYS,
+        )
+    }
+
+    fn new_with_policy(
+        log_root: PathBuf,
+        filename_suffix: &'static str,
+        date_provider: Box<dyn Fn() -> LogDate + Send + Sync>,
+        max_file_bytes: u64,
+        max_files_per_day: u32,
+        retention_days: i64,
+    ) -> Self {
         Self {
             log_root,
             filename_suffix,
             date_provider,
+            max_file_bytes: max_file_bytes.max(1),
+            max_files_per_day: max_files_per_day.max(1),
+            retention_days: retention_days.max(1),
             active_date: None,
+            active_part: 0,
+            active_bytes: 0,
             active_file: None,
         }
     }
 
-    fn active_file(&mut self) -> io::Result<&mut File> {
+    fn open_part(&mut self, date: LogDate, part: u32) -> io::Result<()> {
+        let file_path = rolled_log_file_path(&self.log_root, date, part, self.filename_suffix);
+        if let Some(parent) = file_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new().create(true).append(true).open(file_path)?;
+        self.active_bytes = file.metadata()?.len();
+        self.active_file = Some(file);
+        self.active_date = Some(date);
+        self.active_part = part;
+        Ok(())
+    }
+
+    fn ensure_active_file(&mut self) -> io::Result<()> {
         let date = (self.date_provider)();
         if self.active_date != Some(date) {
-            let file_path = dated_log_file_path(&self.log_root, date, self.filename_suffix);
-            if let Some(parent) = file_path.parent() {
-                std::fs::create_dir_all(parent)?;
+            self.active_file = None;
+            let _ = cleanup_expired_log_partitions(&self.log_root, date, self.retention_days);
+
+            let mut active_part = 0;
+            for part in 0..self.max_files_per_day {
+                if rolled_log_file_path(&self.log_root, date, part, self.filename_suffix).exists() {
+                    active_part = part;
+                } else {
+                    break;
+                }
             }
-            self.active_file = Some(OpenOptions::new().create(true).append(true).open(file_path)?);
-            self.active_date = Some(date);
+            self.open_part(date, active_part)?;
         }
 
-        self.active_file
-            .as_mut()
-            .ok_or_else(|| io::Error::other("log file was not opened"))
+        Ok(())
+    }
+
+    fn shift_daily_parts(&mut self, date: LogDate) {
+        self.active_file = None;
+        let base = rolled_log_file_path(&self.log_root, date, 0, self.filename_suffix);
+        let _ = fs::remove_file(base);
+        for source_part in 1..self.max_files_per_day {
+            let source = rolled_log_file_path(&self.log_root, date, source_part, self.filename_suffix);
+            let target = rolled_log_file_path(&self.log_root, date, source_part - 1, self.filename_suffix);
+            if source.exists() {
+                let _ = fs::rename(source, target);
+            }
+        }
+    }
+
+    fn rotate_if_needed(&mut self, incoming_bytes: usize) -> io::Result<()> {
+        self.ensure_active_file()?;
+        if self.active_bytes == 0 || self.active_bytes.saturating_add(incoming_bytes as u64) <= self.max_file_bytes {
+            return Ok(());
+        }
+
+        let date = self
+            .active_date
+            .ok_or_else(|| io::Error::other("log date was not selected"))?;
+        let next_part = if self.active_part + 1 < self.max_files_per_day {
+            self.active_part + 1
+        } else {
+            self.shift_daily_parts(date);
+            self.max_files_per_day - 1
+        };
+        self.open_part(date, next_part)
     }
 }
 
 impl Write for DailyDatedLogWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.active_file()?.write_all(buf)?;
+        self.rotate_if_needed(buf.len())?;
+        self.active_file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("log file was not opened"))?
+            .write_all(buf)?;
+        self.active_bytes = self.active_bytes.saturating_add(buf.len() as u64);
         Ok(buf.len())
     }
 
@@ -455,6 +631,73 @@ mod tests {
             "july 3\n"
         );
         assert!(!tmp.path().join("2026/07/02/2026-07-03.aioncore.log").exists());
+    }
+
+    #[test]
+    fn dated_file_writer_rolls_by_size_and_caps_daily_parts() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let date = LogDate {
+            year: 2026,
+            month: 7,
+            day: 3,
+        };
+        let mut writer = DailyDatedLogWriter::new_with_policy(
+            tmp.path().to_path_buf(),
+            "aioncore.log",
+            Box::new(move || date),
+            8,
+            3,
+            14,
+        );
+
+        for line in [&b"first\n"[..], &b"second\n"[..], &b"third\n"[..], &b"fourth\n"[..]] {
+            std::io::Write::write_all(&mut writer, line).expect("write rolled line");
+        }
+        std::io::Write::flush(&mut writer).expect("flush");
+
+        let day = tmp.path().join("2026/07/03");
+        assert_eq!(
+            std::fs::read_to_string(day.join("2026-07-03.aioncore.log")).expect("base log"),
+            "second\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(day.join("2026-07-03.1.aioncore.log")).expect("part one"),
+            "third\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(day.join("2026-07-03.2.aioncore.log")).expect("part two"),
+            "fourth\n"
+        );
+        assert_eq!(std::fs::read_dir(day).expect("day logs").count(), 3);
+    }
+
+    #[test]
+    fn cleanup_expired_log_partitions_keeps_retention_window_and_unknown_dirs() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let expired = tmp.path().join("2026/07/06");
+        let boundary = tmp.path().join("2026/07/07");
+        let current = tmp.path().join("2026/07/20");
+        let unknown = tmp.path().join("manual");
+        for dir in [&expired, &boundary, &current, &unknown] {
+            std::fs::create_dir_all(dir).expect("create log partition");
+            std::fs::write(dir.join("keep.log"), b"log").expect("write log");
+        }
+
+        cleanup_expired_log_partitions(
+            tmp.path(),
+            LogDate {
+                year: 2026,
+                month: 7,
+                day: 20,
+            },
+            14,
+        )
+        .expect("cleanup logs");
+
+        assert!(!expired.exists());
+        assert!(boundary.exists());
+        assert!(current.exists());
+        assert!(unknown.exists());
     }
 
     #[test]
