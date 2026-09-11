@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fmt::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use aionui_api_types::{
@@ -40,7 +40,7 @@ pub struct ExternalLaunchService {
     /// the host is allow-listed rather than free-form (SSRF). Loopback covers
     /// the single-machine topology; a MindNProgress sub machine reaches its
     /// paired server over the network, and only that host is added here.
-    allowed_callback_hosts: Arc<HashSet<String>>,
+    allowed_callback_hosts: Arc<RwLock<HashSet<String>>>,
     callback_client: Client,
     conversations: Arc<dyn ExternalLaunchConversationLookup>,
     now: Arc<NowFn>,
@@ -83,7 +83,7 @@ impl ExternalLaunchService {
         now: Arc<NowFn>,
     ) -> Self {
         Self {
-            allowed_callback_hosts: Arc::new(HashSet::new()),
+            allowed_callback_hosts: Arc::new(RwLock::new(HashSet::new())),
             callback_client,
             conversations,
             now,
@@ -91,12 +91,34 @@ impl ExternalLaunchService {
         }
     }
 
-    /// Allow these hosts as callback targets in addition to loopback.
+    /// Seed the allow list at construction (env-provided initial value).
     /// Hosts are matched exactly, lowercased; see [`parse_allowed_callback_hosts`].
     #[must_use]
-    pub fn with_allowed_callback_hosts(mut self, hosts: HashSet<String>) -> Self {
-        self.allowed_callback_hosts = Arc::new(hosts);
+    pub fn with_allowed_callback_hosts(self, hosts: HashSet<String>) -> Self {
+        self.set_allowed_callback_hosts(hosts);
         self
+    }
+
+    /// Replace the allow list while running.
+    ///
+    /// Pairing can happen long after startup, and the paired server can change
+    /// or be disconnected; the desktop host pushes the current set here so the
+    /// backend does not have to be restarted to follow it.
+    pub fn set_allowed_callback_hosts(&self, hosts: HashSet<String>) {
+        match self.allowed_callback_hosts.write() {
+            Ok(mut guard) => *guard = hosts,
+            // A poisoned lock means a previous writer panicked; the allow list
+            // is a plain set, so recovering it is safe and better than dropping
+            // the update (which would silently keep stale hosts allowed).
+            Err(poisoned) => *poisoned.into_inner() = hosts,
+        }
+    }
+
+    fn allowed_callback_hosts(&self) -> HashSet<String> {
+        match self.allowed_callback_hosts.read() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
     }
 
     pub fn issue(
@@ -108,7 +130,7 @@ impl ExternalLaunchService {
             return Err(ExternalLaunchError::CapacityExhausted);
         }
 
-        let (launch, callback_url) = normalize_request(request, &self.allowed_callback_hosts)?;
+        let (launch, callback_url) = normalize_request(request, &self.allowed_callback_hosts())?;
         let now = (self.now)();
         let expires_at_ms = now.saturating_add(LAUNCH_TTL_MS);
         let launch_id = loop {
@@ -672,6 +694,37 @@ mod tests {
             HashSet::from(["192.0.2.1".to_owned(), "mnp.example.test".to_owned()])
         );
         assert!(parse_allowed_callback_hosts("").is_empty());
+    }
+
+    #[test]
+    fn allow_list_can_be_replaced_while_running() {
+        // Pairing happens long after startup, so the set must be mutable
+        // without restarting the backend.
+        let service = service(Arc::new(AtomicI64::new(1_000)), true);
+        let callback = "http://192.0.2.1:4175/api/integrations/aionui/x".to_owned();
+
+        assert_eq!(
+            service.issue(request(Some(callback.clone()))).unwrap_err(),
+            ExternalLaunchError::InvalidCallbackUrl
+        );
+
+        service.set_allowed_callback_hosts(HashSet::from(["192.0.2.1".to_owned()]));
+        assert!(service.issue(request(Some(callback.clone()))).is_ok());
+    }
+
+    #[test]
+    fn replacing_the_allow_list_drops_the_previous_hosts() {
+        // Disconnecting a Runner must stop widening the allow list.
+        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &["192.0.2.1"]);
+        let callback = "http://192.0.2.1:4175/api/integrations/aionui/x".to_owned();
+        assert!(service.issue(request(Some(callback.clone()))).is_ok());
+
+        service.set_allowed_callback_hosts(HashSet::new());
+
+        assert_eq!(
+            service.issue(request(Some(callback))).unwrap_err(),
+            ExternalLaunchError::InvalidCallbackUrl
+        );
     }
 
     #[test]

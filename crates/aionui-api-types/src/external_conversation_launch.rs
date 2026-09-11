@@ -20,6 +20,14 @@ pub struct ExternalConversationLaunchRequest {
     pub auto_send: bool,
 }
 
+/// Replace the hosts allowed as launch callback targets (besides loopback).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetExternalLaunchCallbackHostsRequest {
+    #[serde(default)]
+    pub hosts: Vec<String>,
+}
+
 /// Browser-safe launch payload. The server-only completion URL is omitted.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]

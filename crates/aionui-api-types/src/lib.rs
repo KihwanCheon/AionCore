@@ -135,6 +135,7 @@ pub use external_conversation_dispatch::{
     ExternalConversationDispatchStrategy,
 };
 pub use external_conversation_launch::{
+    SetExternalLaunchCallbackHostsRequest,
     ClaimExternalConversationLaunchRequest, ClaimExternalConversationLaunchResponse,
     CompleteExternalConversationLaunchRequest, CompleteExternalConversationLaunchResponse,
     CreateExternalConversationLaunchResponse, ExternalConversationLaunchCallbackStatus,
