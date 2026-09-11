@@ -34,6 +34,13 @@ type NowFn = dyn Fn() -> i64 + Send + Sync;
 
 #[derive(Clone)]
 pub struct ExternalLaunchService {
+    /// Extra callback hosts allowed alongside loopback.
+    ///
+    /// The callback is a URL this server POSTs to, supplied by the caller, so
+    /// the host is allow-listed rather than free-form (SSRF). Loopback covers
+    /// the single-machine topology; a MindNProgress sub machine reaches its
+    /// paired server over the network, and only that host is added here.
+    allowed_callback_hosts: Arc<HashSet<String>>,
     callback_client: Client,
     conversations: Arc<dyn ExternalLaunchConversationLookup>,
     now: Arc<NowFn>,
@@ -76,11 +83,20 @@ impl ExternalLaunchService {
         now: Arc<NowFn>,
     ) -> Self {
         Self {
+            allowed_callback_hosts: Arc::new(HashSet::new()),
             callback_client,
             conversations,
             now,
             tickets: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Allow these hosts as callback targets in addition to loopback.
+    /// Hosts are matched exactly, lowercased; see [`parse_allowed_callback_hosts`].
+    #[must_use]
+    pub fn with_allowed_callback_hosts(mut self, hosts: HashSet<String>) -> Self {
+        self.allowed_callback_hosts = Arc::new(hosts);
+        self
     }
 
     pub fn issue(
@@ -92,7 +108,7 @@ impl ExternalLaunchService {
             return Err(ExternalLaunchError::CapacityExhausted);
         }
 
-        let (launch, callback_url) = normalize_request(request)?;
+        let (launch, callback_url) = normalize_request(request, &self.allowed_callback_hosts)?;
         let now = (self.now)();
         let expires_at_ms = now.saturating_add(LAUNCH_TTL_MS);
         let launch_id = loop {
@@ -320,13 +336,17 @@ fn format_timestamp(timestamp_ms: i64) -> String {
 
 fn normalize_request(
     request: ExternalConversationLaunchRequest,
+    allowed_callback_hosts: &HashSet<String>,
 ) -> Result<(ExternalConversationLaunchPayload, Option<Url>), ExternalLaunchError> {
     let agent_id = normalize_required(request.agent_id, MAX_OPTION_CHARS)?;
     if request.prompt.trim().is_empty() || request.prompt.len() > MAX_PROMPT_BYTES {
         return Err(ExternalLaunchError::InvalidPayload);
     }
 
-    let callback_url = request.completion_url.map(validate_callback_url).transpose()?;
+    let callback_url = request
+        .completion_url
+        .map(|value| validate_callback_url(value, allowed_callback_hosts))
+        .transpose()?;
     let title = request.title.and_then(|value| {
         let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
         (!normalized.is_empty()).then(|| normalized.chars().take(MAX_TITLE_CHARS).collect())
@@ -382,9 +402,22 @@ fn normalize_list(values: Option<Vec<String>>) -> Result<Option<Vec<String>>, Ex
     Ok(Some(normalized))
 }
 
-fn validate_callback_url(value: String) -> Result<Url, ExternalLaunchError> {
+/// Parse a comma-separated host list (e.g. an env var) into an allow list.
+/// Entries are trimmed and lowercased; blanks are dropped.
+pub fn parse_allowed_callback_hosts(raw: &str) -> HashSet<String> {
+    raw.split(',')
+        .map(|entry| entry.trim().to_ascii_lowercase())
+        .filter(|entry| !entry.is_empty())
+        .collect()
+}
+
+fn validate_callback_url(value: String, allowed_hosts: &HashSet<String>) -> Result<Url, ExternalLaunchError> {
     let url = Url::parse(&value).map_err(|_| ExternalLaunchError::InvalidCallbackUrl)?;
-    let host_allowed = matches!(url.host_str(), Some("127.0.0.1" | "::1"));
+    let host_allowed = match url.host_str() {
+        Some("127.0.0.1" | "::1") => true,
+        Some(host) => allowed_hosts.contains(&host.to_ascii_lowercase()),
+        None => false,
+    };
     let path_allowed = url.path().starts_with("/api/integrations/aionui/");
     if url.scheme() != "http"
         || !host_allowed
@@ -563,6 +596,82 @@ mod tests {
                 ExternalLaunchError::Storage
             );
         }
+    }
+
+    fn service_allowing(now: Arc<AtomicI64>, hosts: &[&str]) -> ExternalLaunchService {
+        service(now, true).with_allowed_callback_hosts(
+            hosts.iter().map(|host| (*host).to_owned()).collect::<HashSet<_>>(),
+        )
+    }
+
+    #[test]
+    fn callback_accepts_an_allow_listed_host() {
+        // A MindNProgress sub machine reaches its paired server over the
+        // network, so loopback alone cannot express its callback.
+        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &["192.0.2.1"]);
+
+        assert!(
+            service
+                .issue(request(Some(
+                    "http://192.0.2.1:4175/api/integrations/aionui/launches/t/conversation".to_owned()
+                )))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn callback_still_rejects_hosts_outside_the_allow_list() {
+        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &["192.0.2.1"]);
+
+        assert_eq!(
+            service
+                .issue(request(Some(
+                    "http://192.0.2.2:4175/api/integrations/aionui/x".to_owned()
+                )))
+                .unwrap_err(),
+            ExternalLaunchError::InvalidCallbackUrl
+        );
+    }
+
+    #[test]
+    fn callback_allow_list_does_not_relax_the_other_rules() {
+        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &["192.0.2.1"]);
+
+        for candidate in [
+            "https://192.0.2.1:4175/api/integrations/aionui/x",
+            "http://192.0.2.1:4175/api/other/x",
+            "http://192.0.2.1:4175/api/integrations/aionui/x?a=1",
+            "http://192.0.2.1:4175/api/integrations/aionui/x#f",
+            "http://user@192.0.2.1:4175/api/integrations/aionui/x",
+        ] {
+            assert_eq!(
+                service.issue(request(Some(candidate.to_owned()))).unwrap_err(),
+                ExternalLaunchError::InvalidCallbackUrl,
+                "{candidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn callback_allow_list_matches_the_host_case_insensitively() {
+        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &["mnp.example.test"]);
+
+        assert!(
+            service
+                .issue(request(Some(
+                    "http://MNP.Example.Test:4175/api/integrations/aionui/x".to_owned()
+                )))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn allow_list_parsing_trims_lowercases_and_drops_blanks() {
+        assert_eq!(
+            parse_allowed_callback_hosts(" 192.0.2.1 , ,MNP.Example.Test,"),
+            HashSet::from(["192.0.2.1".to_owned(), "mnp.example.test".to_owned()])
+        );
+        assert!(parse_allowed_callback_hosts("").is_empty());
     }
 
     #[test]
