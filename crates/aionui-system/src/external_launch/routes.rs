@@ -4,6 +4,7 @@ use aionui_api_types::{
     ApiResponse, ClaimExternalConversationLaunchRequest, ClaimExternalConversationLaunchResponse,
     CompleteExternalConversationLaunchRequest, CompleteExternalConversationLaunchResponse,
     CreateExternalConversationLaunchResponse, ExternalConversationLaunchRequest,
+    SetExternalLaunchCallbackHostsRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -11,7 +12,7 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{DefaultBodyLimit, Extension, Json, State};
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{post, put};
 
 use super::error::ExternalLaunchError;
 use super::state::ExternalLaunchRouterState;
@@ -31,6 +32,10 @@ pub fn external_launch_routes(state: ExternalLaunchRouterState) -> Router {
 pub fn external_launch_internal_routes(state: ExternalLaunchRouterState) -> Router {
     Router::new()
         .route("/api/internal/external-conversation-launches", post(issue_launch))
+        .route(
+            "/api/internal/external-launch/callback-hosts",
+            put(set_callback_hosts),
+        )
         .layer(DefaultBodyLimit::max(EXTERNAL_LAUNCH_BODY_LIMIT))
         .with_state(state)
 }
@@ -42,6 +47,20 @@ async fn issue_launch(
     let Json(request) = body.map_err(ApiError::from)?;
     let response = state.service.issue(request).map_err(map_external_launch_error)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
+}
+
+/// Replace the callback-host allow list. Internal (loopback-only) because it
+/// widens what this server may POST to; the desktop host is the only caller.
+async fn set_callback_hosts(
+    State(state): State<ExternalLaunchRouterState>,
+    body: Result<Json<SetExternalLaunchCallbackHostsRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let hosts = super::service::parse_allowed_callback_hosts(&request.hosts.join(","));
+    let count = hosts.len();
+    state.service.set_allowed_callback_hosts(hosts);
+    tracing::info!(count, "external launch callback host allow list replaced");
+    Ok(Json(ApiResponse::ok(())))
 }
 
 async fn claim_launch(
