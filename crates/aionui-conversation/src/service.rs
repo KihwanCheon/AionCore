@@ -1,3 +1,4 @@
+mod external_report;
 mod mcp_reload;
 mod turn_observation;
 mod workspace_rebind;
@@ -4390,7 +4391,11 @@ impl ConversationService {
     /// target agent's conversation so the UI shows who spoke).
     pub async fn insert_raw_message(&self, user_id: &str, row: &MessageRow) -> Result<(), ConversationError> {
         self.conversation_repo.insert_message(user_id, row).await?;
+        self.broadcast_raw_message(user_id, row);
+        Ok(())
+    }
 
+    fn broadcast_raw_message(&self, user_id: &str, row: &MessageRow) {
         let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
         let content_value: serde_json::Value =
             serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
@@ -4407,7 +4412,6 @@ impl ConversationService {
         });
         self.broadcaster
             .broadcast(WebSocketMessage::new("message.stream", payload));
-        Ok(())
     }
 
     /// Stop the current streaming response for a conversation.

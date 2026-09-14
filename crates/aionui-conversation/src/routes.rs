@@ -20,6 +20,7 @@ use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, now_ms};
 
 use crate::ConversationError;
+use crate::routes_external_dispatch::append_external_report;
 use crate::state::ConversationRouterState;
 
 impl From<ConversationError> for ApiError {
@@ -129,6 +130,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         // "latest" would be captured as a message id and 404.
         .route("/api/conversations/{id}/messages/latest", get(latest_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
+        .route("/api/conversations/{id}/external-reports", post(append_external_report))
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))

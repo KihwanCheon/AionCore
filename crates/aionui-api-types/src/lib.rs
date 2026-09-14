@@ -20,6 +20,7 @@ mod custom_agent;
 mod extension;
 mod external_conversation_dispatch;
 mod external_conversation_launch;
+mod external_conversation_report;
 mod file;
 mod lifecycle;
 mod mcp;
@@ -140,6 +141,7 @@ pub use external_conversation_launch::{
     CreateExternalConversationLaunchResponse, ExternalConversationLaunchCallbackStatus,
     ExternalConversationLaunchPayload, ExternalConversationLaunchRequest,
 };
+pub use external_conversation_report::{ExternalConversationReportRequest, ExternalConversationReportResponse};
 pub use file::{
     ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,
     DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, GetFileMetadataRequest,

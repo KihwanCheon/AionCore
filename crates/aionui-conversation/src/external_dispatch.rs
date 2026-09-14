@@ -206,6 +206,7 @@ impl ExternalConversationDispatchService {
             .then(|| request.workspace_lease.as_ref().map(|lease| lease.project_root.clone()))
             .flatten();
         let instruction = request.instruction;
+        let persist_user_message = request.history_message_id.is_none();
         let release_workspace_runtime = request.workspace_lease.is_some();
         let explicit_completion_after_interruption = request.explicit_completion_after_interruption;
         tokio::spawn(async move {
@@ -223,7 +224,7 @@ impl ExternalConversationDispatchService {
                         files: Vec::new(),
                         inject_skills: Vec::new(),
                         required_runtime_mode: None,
-                        persist_user_message: true,
+                        persist_user_message,
                         user_message_hidden: false,
                         on_resource_waiting: Some(Arc::new(move |waiting| {
                             let waiting_service = waiting_service.clone();
@@ -498,6 +499,11 @@ impl ExternalConversationDispatchService {
                 self.conversation_service
                     .validate_external_dispatch_target(&user_id, target_id)
                     .await?;
+                if let Some(message_id) = request.history_message_id.as_deref() {
+                    self.conversation_service
+                        .validate_external_report_message(&user_id, target_id, message_id, &request.instruction)
+                        .await?;
+                }
                 if let Some(workspace) = request.workspace_lease.as_ref() {
                     info!(
                         operation_id = %request.operation_id,
@@ -742,6 +748,10 @@ fn validate_request(request: &ExternalConversationDispatchRequest) -> Result<(),
         || !valid_identifier(&request.actor_conversation_id, MAX_CONVERSATION_ID_CHARS)
         || request.instruction.trim().is_empty()
         || request.instruction.len() > MAX_INSTRUCTION_BYTES
+        || request
+            .history_message_id
+            .as_deref()
+            .is_some_and(|id| !valid_identifier(id, MAX_CONVERSATION_ID_CHARS))
     {
         return Err(ExternalConversationDispatchError::InvalidPayload);
     }
@@ -761,7 +771,7 @@ fn validate_request(request: &ExternalConversationDispatchRequest) -> Result<(),
             }
         }
         ExternalConversationDispatchStrategy::New => {
-            if request.target_conversation_id.is_some() {
+            if request.target_conversation_id.is_some() || request.history_message_id.is_some() {
                 return Err(ExternalConversationDispatchError::InvalidPayload);
             }
             let create = request
@@ -882,6 +892,7 @@ mod tests {
             strategy,
             target_conversation_id: Some("target-1".to_owned()),
             instruction: "Continue the card work".to_owned(),
+            history_message_id: None,
             create: None,
             workspace_lease: None,
             explicit_completion_after_interruption: false,

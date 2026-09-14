@@ -5,12 +5,14 @@ use std::sync::Arc;
 use aionui_api_types::{
     ApiResponse, ConfirmExternalConversationDispatchCompletionRequest,
     ConfirmExternalConversationDispatchCompletionResponse, ExternalConversationDispatchCapabilities,
-    ExternalConversationDispatchRequest, ExternalConversationDispatchResponse,
+    ExternalConversationDispatchRequest, ExternalConversationDispatchResponse, ExternalConversationReportRequest,
+    ExternalConversationReportResponse,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Json, Path, State};
+use axum::extract::{DefaultBodyLimit, Extension, Json, Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 
@@ -57,7 +59,23 @@ async fn dispatch_capabilities() -> Json<ApiResponse<ExternalConversationDispatc
         releases_runtime_on_terminal: true,
         persistent_recovery_state: true,
         explicit_completion_after_interruption: true,
+        history_only_reports: true,
     }))
+}
+
+pub(crate) async fn append_external_report(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ExternalConversationReportRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ExternalConversationReportResponse>>, ApiError> {
+    let Json(request) = body.map_err(ApiError::from)?;
+    let result = state
+        .service
+        .append_external_report(&user.id, &id, request)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
 }
 
 async fn confirm_dispatch_completion(
