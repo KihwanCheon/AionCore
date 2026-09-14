@@ -50,6 +50,8 @@ pub struct ExternalConversationDispatchCapabilities {
     pub persistent_recovery_state: bool,
     #[serde(default)]
     pub explicit_completion_after_interruption: bool,
+    #[serde(default)]
+    pub history_only_reports: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -61,6 +63,9 @@ pub struct ExternalConversationDispatchRequest {
     #[serde(default)]
     pub target_conversation_id: Option<String>,
     pub instruction: String,
+    /// Reuse an immutable visible report instead of inserting a second user message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_message_id: Option<String>,
     #[serde(default)]
     pub create: Option<ExternalConversationDispatchCreateOptions>,
     #[serde(default)]
@@ -174,11 +179,13 @@ mod tests {
             releases_runtime_on_terminal: true,
             persistent_recovery_state: true,
             explicit_completion_after_interruption: true,
+            history_only_reports: true,
         })
         .unwrap();
         assert_eq!(value["workspaceLeaseVersion"], 2);
         assert_eq!(value["atomicWorkspaceRebind"], true);
         assert_eq!(value["explicitCompletionAfterInterruption"], true);
+        assert_eq!(value["historyOnlyReports"], true);
     }
 
     #[test]

@@ -59,6 +59,8 @@ use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, Conversat
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
+#[path = "service_test/external_report_test.rs"]
+mod external_report_test;
 
 #[path = "service_test/runtime_create_test.rs"]
 mod runtime_create_test;
