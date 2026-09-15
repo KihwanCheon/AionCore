@@ -56,6 +56,7 @@ use aionui_team::{
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
+use crate::fork_integrations::{ForkIntegrationStates, build_fork_integration_states};
 use crate::router::external_launch::build_external_launch_state;
 use crate::router::team_capability_resolver::TeamCapabilityResolver;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
@@ -132,6 +133,7 @@ impl std::error::Error for RouterBuildError {
 pub struct ModuleStates {
     pub system: SystemRouterState,
     pub external_launch: ExternalLaunchRouterState,
+    pub(crate) fork_integrations: ForkIntegrationStates,
     pub conversation: ConversationRouterState,
     pub remote_agent: RemoteAgentRouterState,
     pub agent: AgentRouterState,
@@ -303,6 +305,9 @@ pub async fn build_module_states(
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         external_launch: build_module_state_phase(&boot, "external_launch", || build_external_launch_state(services)),
+        fork_integrations: build_module_state_phase(&boot, "fork_integrations", || {
+            build_fork_integration_states(&services.fork_integrations)
+        }),
         conversation: build_module_state_phase(&boot, "conversation", || {
             build_conversation_state(
                 services,
