@@ -358,7 +358,7 @@ pub(crate) async fn run_server(
     // between us and process exit.
     let drain_started = shutdown_tx.subscribe();
 
-    let serve_future = axum::serve(listener, router)
+    let serve_future = axum::serve(listener, router.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(async move {
             let signal_result = shutdown_signal(parent_exit).await;
             // From here on the process must exit in bounded time so the

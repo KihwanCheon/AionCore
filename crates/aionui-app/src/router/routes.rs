@@ -44,6 +44,7 @@ use aionui_system::external_launch::{external_launch_internal_routes, external_l
 use aionui_system::{ClientPrefService, connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
 
+use crate::fork_integrations::fork_integration_authenticated_routes;
 use crate::services::AppServices;
 
 use super::fs_monitor::spawn_fs_monitor;
@@ -282,6 +283,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let external_launch_authenticated = external_launch_routes(external_launch_state.clone())
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     let external_conversation_dispatch = external_conversation_dispatch_routes(states.conversation.clone());
+    let fork_integrations_authenticated =
+        fork_integration_authenticated_routes(states.fork_integrations, auth_mw_state.clone());
 
     // System routes protected by auth middleware
     let system_authenticated =
@@ -407,6 +410,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .route("/health", get(health_check))
         .merge(auth_routes(auth_state))
         .merge(external_launch_authenticated)
+        .merge(fork_integrations_authenticated)
         .merge(system_authenticated)
         .merge(conversation_authenticated)
         .merge(conversation_ops_authenticated)

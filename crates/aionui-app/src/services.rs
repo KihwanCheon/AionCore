@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
+use crate::fork_integrations::{ForkIntegrationServices, build_fork_integration_services};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
@@ -41,6 +42,7 @@ pub struct AppServices {
     pub runtime_token_service: Arc<RuntimeTokenService>,
     pub conversation_runtime_state: Arc<ConversationRuntimeStateService>,
     pub conversation_service: ConversationService,
+    pub(crate) fork_integrations: ForkIntegrationServices,
     /// Cross-session messaging. The queue, the rate limiter and the notify
     /// handle are shared by the send path, the drainer, and the cancel hook, so
     /// they are built once here (`AppServices` is the sole construction centre).
@@ -274,6 +276,7 @@ impl AppServices {
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
+        let fork_integrations = build_fork_integration_services(conversation_repo.clone(), mcp_server_repo.clone())?;
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Project-bind service (side branch). temp_root mirrors the existing
@@ -438,6 +441,7 @@ impl AppServices {
             runtime_token_service,
             conversation_runtime_state,
             conversation_service,
+            fork_integrations,
             session_message_service,
             session_message_queue,
             session_message_notify,

@@ -25,6 +25,7 @@ mod external_conversation_report;
 mod file;
 mod lifecycle;
 mod mcp;
+mod mindnprogress;
 mod office;
 mod project;
 mod provider;
@@ -164,6 +165,9 @@ pub use mcp::{
     ImportMcpServerRequest, McpAuthMethod, McpConnectionTestErrorCode, McpConnectionTestResult, McpServerResponse,
     McpToolResponse, McpTransport, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
+};
+pub use mindnprogress::{
+    MindNProgressConversationLinkResponse, MindNProgressConversationSelectionResponse, MindNProgressTarget,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
