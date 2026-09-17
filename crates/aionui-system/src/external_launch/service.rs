@@ -626,29 +626,46 @@ mod tests {
         )
     }
 
+    /// This machine's outbound-facing, non-loopback IP address.
+    ///
+    /// The allow-list tests need a real off-loopback host; a UDP "connect"
+    /// makes the OS pick the local address it would send from for that
+    /// destination without actually transmitting a packet. Deriving it here
+    /// keeps a specific machine's real address out of a public repo's test
+    /// fixtures.
+    fn local_non_loopback_ip() -> String {
+        use std::net::UdpSocket;
+        let socket = UdpSocket::bind("0.0.0.0:0").expect("bind ephemeral udp socket");
+        socket.connect("8.8.8.8:80").expect("resolve outbound route (no packet is sent)");
+        socket.local_addr().expect("local socket address").ip().to_string()
+    }
+
     #[test]
     fn callback_accepts_an_allow_listed_host() {
         // A MindNProgress sub machine reaches its paired server over the
         // network, so loopback alone cannot express its callback.
-        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &["192.0.2.1"]);
+        let host = local_non_loopback_ip();
+        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &[host.as_str()]);
 
         assert!(
             service
-                .issue(request(Some(
-                    "http://192.0.2.1:4175/api/integrations/aionui/launches/t/conversation".to_owned()
-                )))
+                .issue(request(Some(format!(
+                    "http://{host}:4175/api/integrations/aionui/launches/t/conversation"
+                ))))
                 .is_ok()
         );
     }
 
     #[test]
     fn callback_still_rejects_hosts_outside_the_allow_list() {
-        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &["192.0.2.1"]);
+        let host = local_non_loopback_ip();
+        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &[host.as_str()]);
 
+        // RFC 5737 TEST-NET-1: guaranteed not to be the allow-listed host above.
         assert_eq!(
             service
                 .issue(request(Some(
-                    "http://192.0.2.2:4175/api/integrations/aionui/x".to_owned()
+                    "http://192.0.2.1:4175/api/integrations/aionui/x".to_owned()
                 )))
                 .unwrap_err(),
             ExternalLaunchError::InvalidCallbackUrl
@@ -657,17 +674,18 @@ mod tests {
 
     #[test]
     fn callback_allow_list_does_not_relax_the_other_rules() {
-        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &["192.0.2.1"]);
+        let host = local_non_loopback_ip();
+        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &[host.as_str()]);
 
         for candidate in [
-            "https://192.0.2.1:4175/api/integrations/aionui/x",
-            "http://192.0.2.1:4175/api/other/x",
-            "http://192.0.2.1:4175/api/integrations/aionui/x?a=1",
-            "http://192.0.2.1:4175/api/integrations/aionui/x#f",
-            "http://user@192.0.2.1:4175/api/integrations/aionui/x",
+            format!("https://{host}:4175/api/integrations/aionui/x"),
+            format!("http://{host}:4175/api/other/x"),
+            format!("http://{host}:4175/api/integrations/aionui/x?a=1"),
+            format!("http://{host}:4175/api/integrations/aionui/x#f"),
+            format!("http://user@{host}:4175/api/integrations/aionui/x"),
         ] {
             assert_eq!(
-                service.issue(request(Some(candidate.to_owned()))).unwrap_err(),
+                service.issue(request(Some(candidate.clone()))).unwrap_err(),
                 ExternalLaunchError::InvalidCallbackUrl,
                 "{candidate}"
             );
@@ -701,22 +719,24 @@ mod tests {
         // Pairing happens long after startup, so the set must be mutable
         // without restarting the backend.
         let service = service(Arc::new(AtomicI64::new(1_000)), true);
-        let callback = "http://192.0.2.1:4175/api/integrations/aionui/x".to_owned();
+        let host = local_non_loopback_ip();
+        let callback = format!("http://{host}:4175/api/integrations/aionui/x");
 
         assert_eq!(
             service.issue(request(Some(callback.clone()))).unwrap_err(),
             ExternalLaunchError::InvalidCallbackUrl
         );
 
-        service.set_allowed_callback_hosts(HashSet::from(["192.0.2.1".to_owned()]));
+        service.set_allowed_callback_hosts(HashSet::from([host]));
         assert!(service.issue(request(Some(callback.clone()))).is_ok());
     }
 
     #[test]
     fn replacing_the_allow_list_drops_the_previous_hosts() {
         // Disconnecting a Runner must stop widening the allow list.
-        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &["192.0.2.1"]);
-        let callback = "http://192.0.2.1:4175/api/integrations/aionui/x".to_owned();
+        let host = local_non_loopback_ip();
+        let service = service_allowing(Arc::new(AtomicI64::new(1_000)), &[host.as_str()]);
+        let callback = format!("http://{host}:4175/api/integrations/aionui/x");
         assert!(service.issue(request(Some(callback.clone()))).is_ok());
 
         service.set_allowed_callback_hosts(HashSet::new());
