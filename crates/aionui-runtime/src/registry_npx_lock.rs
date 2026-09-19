@@ -120,7 +120,7 @@ mod tests {
             [
                 "-y",
                 "--package",
-                "@tencent-ai/codebuddy-code@2.143.1",
+                "@tencent-ai/codebuddy-code@2.151.0",
                 "codebuddy",
                 "--acp"
             ]
@@ -130,7 +130,7 @@ mod tests {
     #[test]
     fn every_lock_entry_has_an_exact_version() {
         let lock = registry_npx_lock().unwrap();
-        assert_eq!(lock.agents.len(), 12);
+        assert_eq!(lock.agents.len(), 13);
         for package in lock.agents.values() {
             assert!(semver::Version::parse(&package.version).is_ok());
         }

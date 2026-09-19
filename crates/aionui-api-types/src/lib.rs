@@ -15,6 +15,7 @@ mod chat_file;
 mod confirmation;
 mod connection_test;
 mod conversation;
+mod conversation_tools;
 mod cron;
 mod custom_agent;
 mod extension;
@@ -109,6 +110,12 @@ pub use conversation::{
 };
 pub use conversation::{
     ConversationRuntimeConfigResponse, ConversationRuntimeConfigSource, ConversationRuntimeConfigValue,
+};
+pub use conversation_tools::{
+    CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,
+    ConversationCreateRequest, ConversationCreateResponse, ConversationToolDescriptor, ConversationToolErrorCode,
+    ConversationToolErrorPayload, ConversationToolName, conversation_tool_descriptor, conversation_tool_descriptors,
+    tool_name_for_conversation_cli_path,
 };
 pub use cron::{
     CreateConversationCronRequest, CreateConversationCronResponse, CreateCronJobRequest, CronAgentConfigReadDto,
