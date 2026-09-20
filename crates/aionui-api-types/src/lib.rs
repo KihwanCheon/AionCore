@@ -21,9 +21,11 @@ mod custom_agent;
 mod extension;
 mod external_conversation_dispatch;
 mod external_conversation_launch;
+mod external_conversation_report;
 mod file;
 mod lifecycle;
 mod mcp;
+mod mindnprogress;
 mod office;
 mod project;
 mod provider;
@@ -147,6 +149,7 @@ pub use external_conversation_launch::{
     CreateExternalConversationLaunchResponse, ExternalConversationLaunchCallbackStatus,
     ExternalConversationLaunchPayload, ExternalConversationLaunchRequest, SetExternalLaunchCallbackHostsRequest,
 };
+pub use external_conversation_report::{ExternalConversationReportRequest, ExternalConversationReportResponse};
 pub use file::{
     ContentEncoding, ContentMetadataRequest, CopyFailure, CopyFilesRequest, CopyFilesResponse, CopyTarget,
     DirOrFileResponse, FetchRemoteImageRequest, FileChangeInfoResponse, FileMetadataResponse, GetFileMetadataRequest,
@@ -162,6 +165,9 @@ pub use mcp::{
     ImportMcpServerRequest, McpAuthMethod, McpConnectionTestErrorCode, McpConnectionTestResult, McpServerResponse,
     McpToolResponse, McpTransport, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
+};
+pub use mindnprogress::{
+    MindNProgressConversationLinkResponse, MindNProgressConversationSelectionResponse, MindNProgressTarget,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
