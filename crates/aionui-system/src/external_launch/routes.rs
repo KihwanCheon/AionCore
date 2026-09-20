@@ -3,8 +3,7 @@
 use aionui_api_types::{
     ApiResponse, ClaimExternalConversationLaunchRequest, ClaimExternalConversationLaunchResponse,
     CompleteExternalConversationLaunchRequest, CompleteExternalConversationLaunchResponse,
-    CreateExternalConversationLaunchResponse, ExternalConversationLaunchRequest,
-    SetExternalLaunchCallbackHostsRequest,
+    CreateExternalConversationLaunchResponse, ExternalConversationLaunchRequest, SetExternalLaunchCallbackHostsRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -32,10 +31,7 @@ pub fn external_launch_routes(state: ExternalLaunchRouterState) -> Router {
 pub fn external_launch_internal_routes(state: ExternalLaunchRouterState) -> Router {
     Router::new()
         .route("/api/internal/external-conversation-launches", post(issue_launch))
-        .route(
-            "/api/internal/external-launch/callback-hosts",
-            put(set_callback_hosts),
-        )
+        .route("/api/internal/external-launch/callback-hosts", put(set_callback_hosts))
         .layer(DefaultBodyLimit::max(EXTERNAL_LAUNCH_BODY_LIMIT))
         .with_state(state)
 }

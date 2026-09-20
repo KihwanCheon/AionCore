@@ -621,9 +621,8 @@ mod tests {
     }
 
     fn service_allowing(now: Arc<AtomicI64>, hosts: &[&str]) -> ExternalLaunchService {
-        service(now, true).with_allowed_callback_hosts(
-            hosts.iter().map(|host| (*host).to_owned()).collect::<HashSet<_>>(),
-        )
+        service(now, true)
+            .with_allowed_callback_hosts(hosts.iter().map(|host| (*host).to_owned()).collect::<HashSet<_>>())
     }
 
     /// This machine's outbound-facing, non-loopback IP address.
@@ -636,7 +635,9 @@ mod tests {
     fn local_non_loopback_ip() -> String {
         use std::net::UdpSocket;
         let socket = UdpSocket::bind("0.0.0.0:0").expect("bind ephemeral udp socket");
-        socket.connect("8.8.8.8:80").expect("resolve outbound route (no packet is sent)");
+        socket
+            .connect("8.8.8.8:80")
+            .expect("resolve outbound route (no packet is sent)");
         socket.local_addr().expect("local socket address").ip().to_string()
     }
 
