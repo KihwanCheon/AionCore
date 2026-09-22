@@ -146,6 +146,47 @@ async fn get_files_by_dir_directories_sorted_first() {
     assert_eq!(items[2].name, "z_file.txt");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn get_files_by_dir_symlink_to_dir_is_browsable() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target_dir");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("inner.txt"), "x").unwrap();
+    std::os::unix::fs::symlink(&target, dir.path().join("link_dir")).unwrap();
+
+    let svc = make_service(dir.path());
+    let root = dir.path().to_str().unwrap();
+    let items = svc.get_files_by_dir(root, root).await.unwrap();
+
+    let link = items.iter().find(|i| i.name == "link_dir").expect("link_dir present");
+    assert!(
+        link.is_dir,
+        "a directory symlink must be browsable through the public trait"
+    );
+    assert_eq!(link.children.len(), 1);
+    assert_eq!(link.children[0].name, "inner.txt");
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn get_files_by_dir_junction_is_browsable() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target_dir");
+    fs::create_dir(&target).unwrap();
+    fs::write(target.join("inner.txt"), "x").unwrap();
+    junction::create(&target, &dir.path().join("link_dir")).unwrap();
+
+    let svc = make_service(dir.path());
+    let root = dir.path().to_str().unwrap();
+    let items = svc.get_files_by_dir(root, root).await.unwrap();
+
+    let link = items.iter().find(|i| i.name == "link_dir").expect("link_dir present");
+    assert!(link.is_dir, "a junction must be browsable through the public trait");
+    assert_eq!(link.children.len(), 1);
+    assert_eq!(link.children[0].name, "inner.txt");
+}
+
 // -----------------------------------------------------------------------
 // listWorkspaceFiles
 // -----------------------------------------------------------------------

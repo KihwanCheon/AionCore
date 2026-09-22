@@ -60,7 +60,8 @@ async fn apply_all_detects_added_and_removed() {
         vec![
             Change::Added {
                 name: "new.txt".to_owned(),
-                kind: Kind::File
+                kind: Kind::File,
+                symlink_target_is_dir: false
             },
             Change::Removed {
                 name: "gone.txt".to_owned()
@@ -88,7 +89,8 @@ async fn apply_child_names_stats_only_named_children() {
         delta.changes,
         vec![Change::Added {
             name: "added.txt".to_owned(),
-            kind: Kind::File
+            kind: Kind::File,
+            symlink_target_is_dir: false
         }]
     );
 }
@@ -258,10 +260,55 @@ async fn apply_kind_change_is_remove_plus_add() {
         vec![
             Change::Added {
                 name: "x".to_owned(),
-                kind: Kind::Dir
+                kind: Kind::Dir,
+                symlink_target_is_dir: false
             },
             Change::Removed { name: "x".to_owned() },
         ]
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn apply_all_detects_symlink_to_dir_as_browsable() {
+    let (mut tree, dir) = real_tree();
+    let target = dir.path().join("target_dir");
+    std::fs::create_dir(&target).unwrap();
+    let c = canon(dir.path());
+    tree.mount(c.as_str()).await.unwrap();
+
+    std::os::unix::fs::symlink(&target, dir.path().join("link_dir")).unwrap();
+
+    let delta = tree.apply(c.as_str(), Hint::All).await.unwrap().expect("changes");
+    assert_eq!(
+        delta.changes,
+        vec![Change::Added {
+            name: "link_dir".to_owned(),
+            kind: Kind::Symlink,
+            symlink_target_is_dir: true,
+        }]
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn apply_all_detects_junction_as_browsable() {
+    let (mut tree, dir) = real_tree();
+    let target = dir.path().join("target_dir");
+    std::fs::create_dir(&target).unwrap();
+    let c = canon(dir.path());
+    tree.mount(c.as_str()).await.unwrap();
+
+    junction::create(&target, dir.path().join("link_dir")).unwrap();
+
+    let delta = tree.apply(c.as_str(), Hint::All).await.unwrap().expect("changes");
+    assert_eq!(
+        delta.changes,
+        vec![Change::Added {
+            name: "link_dir".to_owned(),
+            kind: Kind::Symlink,
+            symlink_target_is_dir: true,
+        }]
     );
 }
 
@@ -289,6 +336,7 @@ fn file_fact_at(inode: u64, mtime_ms: Option<i64>) -> EntryFact {
         kind: Kind::File,
         inode,
         symlink_target: None,
+        symlink_target_is_dir: false,
         mtime_ms,
     }
 }
@@ -302,15 +350,21 @@ fn dir_fact_at(inode: u64, mtime_ms: Option<i64>) -> EntryFact {
         kind: Kind::Dir,
         inode,
         symlink_target: None,
+        symlink_target_is_dir: false,
         mtime_ms,
     }
 }
 
 fn symlink_fact_at(inode: u64, mtime_ms: Option<i64>) -> EntryFact {
+    symlink_fact_at_with(inode, mtime_ms, false)
+}
+
+fn symlink_fact_at_with(inode: u64, mtime_ms: Option<i64>, target_is_dir: bool) -> EntryFact {
     EntryFact {
         kind: Kind::Symlink,
         inode,
         symlink_target: Some("target".to_owned()),
+        symlink_target_is_dir: target_is_dir,
         mtime_ms,
     }
 }
@@ -332,7 +386,8 @@ fn diff_same_inode_kind_change_is_remove_add_not_rename() {
         vec![
             Change::Added {
                 name: "x".to_owned(),
-                kind: Kind::Dir
+                kind: Kind::Dir,
+                symlink_target_is_dir: false
             },
             Change::Removed { name: "x".to_owned() },
         ]
@@ -354,7 +409,8 @@ fn diff_inode_zero_rename_degrades_to_remove_add() {
         vec![
             Change::Added {
                 name: "b".to_owned(),
-                kind: Kind::File
+                kind: Kind::File,
+                symlink_target_is_dir: false
             },
             Change::Removed { name: "a".to_owned() },
         ]
@@ -449,6 +505,23 @@ fn diff_dir_and_symlink_mtime_change_is_not_modified() {
 }
 
 #[test]
+fn diff_added_symlink_to_dir_carries_target_is_dir() {
+    // A symlink/junction created while the parent is mounted must reach the
+    // wire able to expand immediately — not just after the next remount.
+    let old = BTreeMap::new();
+    let fresh = BTreeMap::from([("link_dir".to_owned(), symlink_fact_at_with(9, Some(MTIME), true))]);
+
+    assert_eq!(
+        diff(&old, &fresh),
+        vec![Change::Added {
+            name: "link_dir".to_owned(),
+            kind: Kind::Symlink,
+            symlink_target_is_dir: true,
+        }]
+    );
+}
+
+#[test]
 fn diff_kind_change_with_moved_mtime_is_remove_add_not_modified() {
     // A file replaced by a same-named directory changes kind *and* mtime. Kind
     // change wins: Removed + Added. Emitting Modified as well would tell a
@@ -463,7 +536,8 @@ fn diff_kind_change_with_moved_mtime_is_remove_add_not_modified() {
         vec![
             Change::Added {
                 name: "x".to_owned(),
-                kind: Kind::Dir
+                kind: Kind::Dir,
+                symlink_target_is_dir: false
             },
             Change::Removed { name: "x".to_owned() },
         ]
@@ -508,7 +582,8 @@ fn diff_reports_modified_alongside_other_changes() {
         vec![
             Change::Added {
                 name: "new.txt".to_owned(),
-                kind: Kind::File
+                kind: Kind::File,
+                symlink_target_is_dir: false
             },
             Change::Modified {
                 name: "kept.txt".to_owned()

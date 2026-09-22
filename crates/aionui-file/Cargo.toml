@@ -33,3 +33,8 @@ dirs.workspace = true
 tempfile = "3"
 base64.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+# Windows-only: creates NTFS junctions in tests without the elevated privilege
+# real directory symlinks require (mirrors aionui-extension's skill_service use).
+[target.'cfg(windows)'.dev-dependencies]
+junction = "1"

@@ -851,6 +851,7 @@ fn to_dir_or_file_response(d: DirOrFile) -> DirOrFileResponse {
         relative_path: d.relative_path,
         is_dir: d.is_dir,
         is_file: !d.is_dir,
+        is_symlink: d.is_symlink,
         children,
     }
 }
@@ -1223,6 +1224,7 @@ mod tests {
             full_path: "/ws/test.txt".into(),
             relative_path: "test.txt".into(),
             is_dir: false,
+            is_symlink: false,
             children: vec![],
         };
         let r = to_dir_or_file_response(d);
@@ -1239,11 +1241,13 @@ mod tests {
             full_path: "/ws/src".into(),
             relative_path: "src".into(),
             is_dir: true,
+            is_symlink: false,
             children: vec![DirOrFile {
                 name: "main.rs".into(),
                 full_path: "/ws/src/main.rs".into(),
                 relative_path: "src/main.rs".into(),
                 is_dir: false,
+                is_symlink: false,
                 children: vec![],
             }],
         };
@@ -1253,6 +1257,29 @@ mod tests {
         let children = r.children.unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].name, "main.rs");
+    }
+
+    #[test]
+    fn dir_or_file_response_conversion_symlink_to_dir_is_browsable_and_flagged() {
+        let d = DirOrFile {
+            name: "link_dir".into(),
+            full_path: "/ws/link_dir".into(),
+            relative_path: "link_dir".into(),
+            is_dir: true,
+            is_symlink: true,
+            children: vec![DirOrFile {
+                name: "inner.txt".into(),
+                full_path: "/ws/link_dir/inner.txt".into(),
+                relative_path: "link_dir/inner.txt".into(),
+                is_dir: false,
+                is_symlink: false,
+                children: vec![],
+            }],
+        };
+        let r = to_dir_or_file_response(d);
+        assert!(r.is_dir, "browsable — children must be included, not dropped");
+        assert!(r.is_symlink, "identity flag carried through to the wire");
+        assert_eq!(r.children.unwrap().len(), 1);
     }
 
     #[test]

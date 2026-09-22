@@ -125,21 +125,28 @@ async fn copy_dir_recursive(src: &Path, dst: &Path) -> io::Result<()> {
 async fn fact_of(uri: &str, path: &Path) -> Result<EntryFact, FsError> {
     let meta = tokio::fs::symlink_metadata(path).await.map_err(|e| map_io(uri, &e))?;
     let ft = meta.file_type();
-    let (kind, symlink_target) = if ft.is_symlink() {
+    let (kind, symlink_target, symlink_target_is_dir) = if ft.is_symlink() {
         let target = tokio::fs::read_link(path)
             .await
             .ok()
             .map(|p| p.to_string_lossy().into_owned());
-        (Kind::Symlink, target)
+        // A second, link-following stat — paid only for symlinks — so a
+        // symlink/junction pointing at a directory can be reported browsable.
+        // Any failure (dangling link, permission denied, loop) degrades to
+        // "not a directory": the identity classification above already
+        // succeeded, so the entry still lists, just as a leaf.
+        let target_is_dir = tokio::fs::metadata(path).await.map(|m| m.is_dir()).unwrap_or(false);
+        (Kind::Symlink, target, target_is_dir)
     } else if ft.is_dir() {
-        (Kind::Dir, None)
+        (Kind::Dir, None, false)
     } else {
-        (Kind::File, None)
+        (Kind::File, None, false)
     };
     Ok(EntryFact {
         kind,
         inode: inode_of(&meta),
         symlink_target,
+        symlink_target_is_dir,
         // Read off the metadata already fetched above — no extra syscall.
         mtime_ms: mtime_ms_of(&meta),
     })

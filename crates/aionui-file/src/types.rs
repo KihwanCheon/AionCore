@@ -30,7 +30,15 @@ pub struct DirOrFile {
     pub name: String,
     pub full_path: String,
     pub relative_path: String,
+    /// Whether this entry can be browsed into like a directory. `true` for a
+    /// real directory, and also for a symlink/junction whose target is a
+    /// directory (resolved via a link-following stat) — mac symlink and
+    /// Windows junction alike, since Windows reports both the same way.
     pub is_dir: bool,
+    /// Identity flag, independent of `is_dir`: this entry is a symlink or
+    /// Windows junction (as opposed to a real directory/file). Lets a client
+    /// render it distinctly even though `is_dir` may say it is browsable.
+    pub is_symlink: bool,
     pub children: Vec<DirOrFile>,
 }
 
@@ -211,11 +219,13 @@ mod tests {
             full_path: "/project/src".into(),
             relative_path: "src".into(),
             is_dir: true,
+            is_symlink: false,
             children: vec![DirOrFile {
                 name: "main.rs".into(),
                 full_path: "/project/src/main.rs".into(),
                 relative_path: "src/main.rs".into(),
                 is_dir: false,
+                is_symlink: false,
                 children: vec![],
             }],
         };

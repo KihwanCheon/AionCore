@@ -208,6 +208,93 @@ async fn symlink_reports_kind_and_target() {
     let fact = provider.stat(&uri(&link)).await.unwrap().expect("some");
     assert_eq!(fact.kind, Kind::Symlink);
     assert!(fact.symlink_target.is_some());
+    // Points at a file, not a directory — not browsable.
+    assert!(!fact.symlink_target_is_dir);
+}
+
+// ── symlink/junction "treat as directory" (mac symlink, windows junction) ───
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_to_dir_reports_target_is_dir() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target_dir");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link_dir");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let provider = LocalFsProvider::new();
+    let fact = provider.stat(&uri(&link)).await.unwrap().expect("some");
+    // Identity stays Symlink (never folded into Dir) — only the new flag says
+    // it is browsable, so rename/diff semantics for symlinks are untouched.
+    assert_eq!(fact.kind, Kind::Symlink);
+    assert!(fact.symlink_target_is_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn dangling_symlink_reports_target_is_not_dir() {
+    let dir = tempdir().unwrap();
+    let missing = dir.path().join("gone");
+    let link = dir.path().join("dangling");
+    std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+    let provider = LocalFsProvider::new();
+    let fact = provider.stat(&uri(&link)).await.unwrap().expect("some");
+    assert_eq!(fact.kind, Kind::Symlink);
+    // Nothing to follow into — must degrade to "not a directory", not error.
+    assert!(!fact.symlink_target_is_dir);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn read_dir_follows_symlink_to_directory() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target_dir");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("inner.txt"), b"x").unwrap();
+    let link = dir.path().join("link_dir");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+
+    let provider = LocalFsProvider::new();
+    // Browsing the symlink's own URI as a directory (what the tree does on
+    // expand) lists the target's children — the OS follows the link for us.
+    let entries = provider.read_dir(&uri(&link)).await.unwrap();
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["inner.txt"]);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn junction_reports_kind_symlink_and_target_is_dir() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target_dir");
+    std::fs::create_dir(&target).unwrap();
+    let link = dir.path().join("link_dir");
+    junction::create(&target, &link).unwrap();
+
+    let provider = LocalFsProvider::new();
+    let fact = provider.stat(&uri(&link)).await.unwrap().expect("some");
+    // Windows reports a junction's reparse point as `is_symlink() == true`
+    // (same name-surrogate bit as a real symlink) — same code path as unix.
+    assert_eq!(fact.kind, Kind::Symlink);
+    assert!(fact.symlink_target_is_dir);
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn read_dir_follows_junction_to_directory() {
+    let dir = tempdir().unwrap();
+    let target = dir.path().join("target_dir");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("inner.txt"), b"x").unwrap();
+    let link = dir.path().join("link_dir");
+    junction::create(&target, &link).unwrap();
+
+    let provider = LocalFsProvider::new();
+    let entries = provider.read_dir(&uri(&link)).await.unwrap();
+    let names: Vec<&str> = entries.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, vec!["inner.txt"]);
 }
 
 #[cfg(unix)]
