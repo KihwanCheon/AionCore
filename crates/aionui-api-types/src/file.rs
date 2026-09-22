@@ -214,6 +214,11 @@ pub struct DirOrFileResponse {
     pub relative_path: String,
     pub is_dir: bool,
     pub is_file: bool,
+    /// Identity flag, independent of `is_dir`: true for a symlink or Windows
+    /// junction (`is_dir` may still be true for one whose target is a
+    /// directory — that is what makes it browsable). Lets a client render it
+    /// distinctly from a real directory/file.
+    pub is_symlink: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub children: Option<Vec<DirOrFileResponse>>,
 }
@@ -400,12 +405,14 @@ mod tests {
             relative_path: "src".into(),
             is_dir: true,
             is_file: false,
+            is_symlink: false,
             children: Some(vec![DirOrFileResponse {
                 name: "main.rs".into(),
                 full_path: "/project/src/main.rs".into(),
                 relative_path: "src/main.rs".into(),
                 is_dir: false,
                 is_file: true,
+                is_symlink: false,
                 children: None,
             }]),
         };
@@ -415,6 +422,7 @@ mod tests {
         assert_eq!(json["relative_path"], "src");
         assert_eq!(json["is_dir"], true);
         assert_eq!(json["is_file"], false);
+        assert_eq!(json["is_symlink"], false);
         assert_eq!(json["children"][0]["name"], "main.rs");
     }
 
@@ -426,10 +434,29 @@ mod tests {
             relative_path: "file.txt".into(),
             is_dir: false,
             is_file: true,
+            is_symlink: false,
             children: None,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("children").is_none());
+    }
+
+    #[test]
+    fn dir_or_file_response_symlink_dir_serialization() {
+        // A browsable symlink/junction: is_dir true (so the client can list into
+        // it) AND is_symlink true (so the client can render it distinctly).
+        let resp = DirOrFileResponse {
+            name: "link_dir".into(),
+            full_path: "/ws/link_dir".into(),
+            relative_path: "link_dir".into(),
+            is_dir: true,
+            is_file: false,
+            is_symlink: true,
+            children: Some(vec![]),
+        };
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["is_dir"], true);
+        assert_eq!(json["is_symlink"], true);
     }
 
     #[test]

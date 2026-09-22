@@ -129,6 +129,26 @@ impl FileService {
     }
 }
 
+/// Resolve `(is_dir, is_symlink)` for a directory-tree entry.
+///
+/// `is_dir` is a *browsability* fact: a plain stat would follow symlinks
+/// automatically, but `DirEntry::metadata` (used previously) does not, so a
+/// symlink/junction pointing at a directory came back as `is_dir = false` — a
+/// leaf, not a directory. This resolves identity via `symlink_metadata` (does
+/// not follow) and, only for a symlink, a second link-following stat to learn
+/// what it points at. A broken link's follow-stat errors and degrades to
+/// `is_dir = false` (nothing to browse into, but still a listable leaf).
+fn entry_dir_and_symlink(path: &Path) -> std::io::Result<(bool, bool)> {
+    let link_meta = std::fs::symlink_metadata(path)?;
+    let is_symlink = link_meta.file_type().is_symlink();
+    let is_dir = if is_symlink {
+        std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+    } else {
+        link_meta.is_dir()
+    };
+    Ok((is_dir, is_symlink))
+}
+
 /// Synchronous directory tree builder (runs in blocking thread pool).
 fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileError> {
     let entries = std::fs::read_dir(dir)
@@ -140,8 +160,7 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
         let entry = entry.map_err(|e| FileError::Internal(format!("error reading directory entry: {e}")))?;
 
         let path = entry.path();
-        let metadata = entry
-            .metadata()
+        let (is_dir, is_symlink) = entry_dir_and_symlink(&path)
             .map_err(|e| FileError::Internal(format!("cannot read metadata for '{}': {e}", path.display())))?;
 
         let name = entry.file_name().to_string_lossy().into_owned();
@@ -149,9 +168,8 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
         let full_path = strip_verbatim_prefix(&path.to_string_lossy());
         let relative_path = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().into_owned();
 
-        let is_dir = metadata.is_dir();
-
-        // For directories, also read their immediate children
+        // For directories (real or a browsable symlink/junction), also read
+        // their immediate children — `read_dir` follows a symlink path itself.
         let children = if is_dir {
             read_children_sync(&path, root)?
         } else {
@@ -163,6 +181,7 @@ fn build_dir_tree_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileEr
             full_path,
             relative_path,
             is_dir,
+            is_symlink,
             children,
         });
     }
@@ -189,7 +208,7 @@ fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileErr
         };
 
         let path = entry.path();
-        let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
+        let (is_dir, is_symlink) = entry_dir_and_symlink(&path).unwrap_or((false, false));
 
         let name = entry.file_name().to_string_lossy().into_owned();
 
@@ -201,6 +220,7 @@ fn read_children_sync(dir: &Path, root: &Path) -> Result<Vec<DirOrFile>, FileErr
             full_path,
             relative_path,
             is_dir,
+            is_symlink,
             children: Vec::new(),
         });
     }
@@ -1277,6 +1297,73 @@ mod tests {
             files.iter().all(|f| f.name != "aionui-skills"),
             "directory symlink should not be surfaced as a file: {files:?}"
         );
+    }
+
+    // ── symlink/junction "treat as directory" (mac symlink, windows junction) ──
+
+    #[cfg(unix)]
+    #[test]
+    fn build_dir_tree_sync_symlink_to_dir_is_browsable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target_dir");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inner.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link_dir")).unwrap();
+
+        let result = build_dir_tree_sync(dir.path(), dir.path()).unwrap();
+        let link = result.iter().find(|d| d.name == "link_dir").expect("link_dir present");
+        assert!(link.is_dir, "a directory symlink must be browsable");
+        assert!(link.is_symlink, "identity must still say symlink");
+        assert_eq!(link.children.len(), 1, "children resolved one level in");
+        assert_eq!(link.children[0].name, "inner.txt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_dir_tree_sync_dangling_symlink_is_not_browsable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(dir.path().join("gone"), dir.path().join("dangling")).unwrap();
+
+        let result = build_dir_tree_sync(dir.path(), dir.path()).unwrap();
+        let link = result.iter().find(|d| d.name == "dangling").expect("dangling present");
+        assert!(!link.is_dir);
+        assert!(link.is_symlink);
+        assert!(link.children.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_dir_tree_sync_sorts_symlink_dir_with_real_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("zzz_real_dir")).unwrap();
+        fs::write(dir.path().join("aaa_file.txt"), "x").unwrap();
+        let target = dir.path().join("target_dir");
+        fs::create_dir(&target).unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("bbb_link_dir")).unwrap();
+
+        let result = build_dir_tree_sync(dir.path(), dir.path()).unwrap();
+        let names: Vec<&str> = result.iter().map(|d| d.name.as_str()).collect();
+        // Both real and symlinked directories precede the file, sorted together.
+        assert_eq!(names, vec!["bbb_link_dir", "zzz_real_dir", "aaa_file.txt"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn build_dir_tree_sync_junction_is_browsable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target_dir");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("inner.txt"), "x").unwrap();
+        junction::create(&target, &dir.path().join("link_dir")).unwrap();
+
+        let result = build_dir_tree_sync(dir.path(), dir.path()).unwrap();
+        let link = result.iter().find(|d| d.name == "link_dir").expect("link_dir present");
+        // Windows reports a junction's reparse point as `is_symlink() == true`
+        // (same name-surrogate bit as a real symlink) — same code path as unix.
+        assert!(link.is_dir, "a junction must be browsable");
+        assert!(link.is_symlink, "identity must still say symlink");
+        assert_eq!(link.children.len(), 1, "children resolved one level in");
+        assert_eq!(link.children[0].name, "inner.txt");
     }
 
     #[test]

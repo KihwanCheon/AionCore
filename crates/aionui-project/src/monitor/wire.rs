@@ -194,6 +194,17 @@ pub struct WireEntry {
     pub kind: WireKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
+    /// Whether a symlink/junction's target is a directory — lets the client
+    /// browse into it like a real directory while still rendering it as a
+    /// symlink (distinct icon/color). Omitted (defaults `false`) for the
+    /// common file/dir/non-browsable-symlink case, matching `symlink_target`'s
+    /// lean-payload convention.
+    #[serde(skip_serializing_if = "is_false")]
+    pub symlink_target_is_dir: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl WireEntry {
@@ -203,6 +214,7 @@ impl WireEntry {
             name: name.to_owned(),
             kind: fact.kind.into(),
             symlink_target: fact.symlink_target.clone(),
+            symlink_target_is_dir: fact.symlink_target_is_dir,
         }
     }
 }
@@ -269,11 +281,21 @@ pub fn delta_params(delta: &DeltaBatch, target: &ResourceRef) -> Value {
 /// modified).
 fn change_to_wire(change: &Change) -> Value {
     match change {
-        Change::Added { name, kind } => json!({
-            "op": "added",
-            "name": name,
-            "kind": WireKind::from(*kind),
-        }),
+        Change::Added {
+            name,
+            kind,
+            symlink_target_is_dir,
+        } => {
+            let mut v = json!({
+                "op": "added",
+                "name": name,
+                "kind": WireKind::from(*kind),
+            });
+            if *symlink_target_is_dir {
+                v["symlink_target_is_dir"] = json!(true);
+            }
+            v
+        }
         Change::Removed { name } => json!({
             "op": "removed",
             "name": name,

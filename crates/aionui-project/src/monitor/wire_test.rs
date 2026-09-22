@@ -10,6 +10,7 @@ fn fact(kind: Kind) -> EntryFact {
         kind,
         inode: 7,
         symlink_target: None,
+        symlink_target_is_dir: false,
         // Non-`None` on purpose: the wire-projection tests below assert the
         // serialized entry carries no mtime, which only proves anything if the
         // fact going in had one.
@@ -100,11 +101,28 @@ fn wire_entry_symlink_includes_target() {
         kind: Kind::Symlink,
         inode: 1,
         symlink_target: Some("target".to_owned()),
+        symlink_target_is_dir: false,
         mtime_ms: Some(1_700_000_000_000),
     };
     let v = serde_json::to_value(WireEntry::from_fact("link", &ef)).unwrap();
     assert_eq!(v["kind"], "symlink");
     assert_eq!(v["symlink_target"], "target");
+    // Not browsable — the lean/common case, field omitted rather than `false`.
+    assert!(v.get("symlink_target_is_dir").is_none());
+}
+
+#[test]
+fn wire_entry_symlink_to_dir_includes_target_is_dir() {
+    let ef = EntryFact {
+        kind: Kind::Symlink,
+        inode: 1,
+        symlink_target: Some("target_dir".to_owned()),
+        symlink_target_is_dir: true,
+        mtime_ms: Some(1_700_000_000_000),
+    };
+    let v = serde_json::to_value(WireEntry::from_fact("link_dir", &ef)).unwrap();
+    assert_eq!(v["kind"], "symlink");
+    assert_eq!(v["symlink_target_is_dir"], true);
 }
 
 // ── snapshot / delta params ───────────────────────────────────────────────
@@ -141,6 +159,7 @@ fn delta_params_tags_each_change_op() {
             Change::Added {
                 name: "new.ts".to_owned(),
                 kind: Kind::File,
+                symlink_target_is_dir: false,
             },
             Change::Removed {
                 name: "old.ts".to_owned(),
@@ -164,6 +183,27 @@ fn delta_params_tags_each_change_op() {
     // subscriber replaying it as a write precondition would make its own save pass
     // conflict detection against the edit this op exists to warn about.
     assert_eq!(v["changes"][3], json!({"op":"modified","name":"edited.ts"}));
+    // The common case omits the field entirely rather than sending `false`.
+    assert!(v["changes"][0].get("symlink_target_is_dir").is_none());
+}
+
+#[test]
+fn delta_params_added_symlink_to_dir_carries_target_is_dir() {
+    // A symlink/junction created while the parent is mounted must be
+    // immediately browsable — not just after the next remount/snapshot.
+    let delta = DeltaBatch {
+        canonical: "file:///x".to_owned(),
+        changes: vec![Change::Added {
+            name: "link_dir".to_owned(),
+            kind: Kind::Symlink,
+            symlink_target_is_dir: true,
+        }],
+    };
+    let v = delta_params(&delta, &target());
+    assert_eq!(
+        v["changes"][0],
+        json!({"op":"added","name":"link_dir","kind":"symlink","symlink_target_is_dir":true})
+    );
 }
 
 // ── frame builders ────────────────────────────────────────────────────────

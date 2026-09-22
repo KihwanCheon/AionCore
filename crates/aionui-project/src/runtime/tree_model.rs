@@ -39,6 +39,11 @@ pub enum Change {
     Added {
         name: String,
         kind: Kind,
+        /// Carried through from the fact so a symlink/junction added while a
+        /// directory is mounted (not just its initial snapshot) is immediately
+        /// browsable without waiting for a remount. See
+        /// [`EntryFact::symlink_target_is_dir`].
+        symlink_target_is_dir: bool,
     },
     Removed {
         name: String,
@@ -191,7 +196,11 @@ fn diff(old: &BTreeMap<String, EntryFact>, fresh: &BTreeMap<String, EntryFact>) 
 
     for (i, (name, af)) in added.into_iter().enumerate() {
         if !used_added[i] {
-            changes.push(Change::Added { name, kind: af.kind });
+            changes.push(Change::Added {
+                name,
+                kind: af.kind,
+                symlink_target_is_dir: af.symlink_target_is_dir,
+            });
         }
     }
     for (name, _) in removed {

@@ -32,6 +32,16 @@ pub struct EntryFact {
     pub inode: u64,
     /// Link target when `kind == Symlink`.
     pub symlink_target: Option<String>,
+    /// Whether a symlink's target resolves (link-following stat) to a
+    /// directory. Always `false` when `kind != Symlink`, and also `false` for a
+    /// symlink whose target cannot be resolved (dangling link, permission
+    /// denied, loop) — a consumer then renders it as a leaf rather than
+    /// offering to browse into something unreadable. Orthogonal to `kind`: a
+    /// symlink's own identity (rename/diff, wire `kind`) is unchanged — this
+    /// only tells a client whether the same URI is safe to `read_dir` as a
+    /// directory listing (mac symlink and Windows junction alike: Windows
+    /// reports both as `is_symlink()`, so this one flag covers both).
+    pub symlink_target_is_dir: bool,
     /// Last-modified time in milliseconds since the Unix epoch, used only to
     /// detect that an entry's *content* changed (`Change::Modified`).
     ///
