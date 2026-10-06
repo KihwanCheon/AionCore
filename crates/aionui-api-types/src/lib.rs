@@ -167,7 +167,8 @@ pub use mcp::{
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
 pub use mindnprogress::{
-    MindNProgressConversationLinkResponse, MindNProgressConversationSelectionResponse, MindNProgressTarget,
+    MindNProgressConversationLinkResponse, MindNProgressConversationSelectionResponse, MindNProgressGroup,
+    MindNProgressGroupRole, MindNProgressTarget,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,

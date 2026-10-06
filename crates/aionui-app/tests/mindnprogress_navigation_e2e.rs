@@ -63,7 +63,12 @@ async fn navigation_relay_is_authenticated_owner_scoped_csrf_protected_and_token
                 "documentTitle": "Document title",
                 "cardId": "card-1",
                 "cardTitle": "Card title",
-                "archived": false
+                "archived": false,
+                "group": {
+                    "id": "group-1",
+                    "title": "Renamed group",
+                    "role": "coordinator"
+                }
             },
             "selectionAvailable": false,
             "matchingViewCount": 0,
@@ -88,7 +93,12 @@ async fn navigation_relay_is_authenticated_owner_scoped_csrf_protected_and_token
                 "documentTitle": "Document title",
                 "cardId": "card-1",
                 "cardTitle": "Card title",
-                "archived": false
+                "archived": false,
+                "group": {
+                    "id": "group-1",
+                    "title": "Renamed group",
+                    "role": "coordinator"
+                }
             },
             "deliveredClientCount": 1,
             "requestedAt": "2026-09-15T00:00:00.000Z",
@@ -139,6 +149,9 @@ async fn navigation_relay_is_authenticated_owner_scoped_csrf_protected_and_token
     assert_eq!(lookup_body["data"]["matchingViewCount"], 0);
     assert_eq!(lookup_body["data"]["localSelectionAvailable"], false);
     assert_eq!(lookup_body["data"]["target"]["documentTitle"], "Document title");
+    assert_eq!(lookup_body["data"]["target"]["group"]["id"], "group-1");
+    assert_eq!(lookup_body["data"]["target"]["group"]["title"], "Renamed group");
+    assert_eq!(lookup_body["data"]["target"]["group"]["role"], "coordinator");
     assert!(!lookup_body.to_string().contains("integration-secret"));
     assert!(!lookup_body.to_string().contains("10.77.15.55"));
 
@@ -181,6 +194,7 @@ async fn navigation_relay_is_authenticated_owner_scoped_csrf_protected_and_token
     let selection_body = body_json(selection).await;
     assert_eq!(selection_body["data"]["selected"], true);
     assert_eq!(selection_body["data"]["message"], "selected");
+    assert_eq!(selection_body["data"]["target"]["group"]["title"], "Renamed group");
     assert!(!selection_body.to_string().contains("integration-secret"));
     assert!(!selection_body.to_string().contains("10.77.15.55"));
 

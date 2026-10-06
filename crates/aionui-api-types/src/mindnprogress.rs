@@ -2,12 +2,28 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct MindNProgressGroup {
+    pub id: String,
+    pub title: String,
+    pub role: MindNProgressGroupRole,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MindNProgressGroupRole {
+    Coordinator,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct MindNProgressTarget {
     pub map_id: String,
     pub document_title: String,
     pub card_id: String,
     pub card_title: String,
     pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<MindNProgressGroup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

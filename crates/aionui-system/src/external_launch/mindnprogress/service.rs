@@ -341,6 +341,7 @@ mod tests {
                 card_id: "card-1".to_owned(),
                 card_title: "Card".to_owned(),
                 archived: false,
+                group: None,
             }),
             selection_available: false,
             matching_view_count: 0,
