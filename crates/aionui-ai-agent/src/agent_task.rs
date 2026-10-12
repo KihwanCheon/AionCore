@@ -273,7 +273,9 @@ impl AgentInstance {
 
     /// Send a user message to the agent.
     pub async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
-        self.as_task().send_message(data).await
+        self.as_task()
+            .send_message(crate::capability::user_choice_notice::with_user_choice_notice(data))
+            .await
     }
 
     /// B5 mid-turn delivery: hand a message to the RUNNING turn instead of
@@ -282,6 +284,7 @@ impl AgentInstance {
     /// gates on that bit before routing here. Variants without the path reject
     /// (the caller must not have routed them here).
     pub async fn deliver_midturn(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        let data = crate::capability::user_choice_notice::with_user_choice_notice(data);
         match self {
             Self::Acp(_) | Self::Aionrs(_) => Err(AgentSendError::from_agent_error(AgentError::BadRequest(
                 "mid-turn delivery is not supported by this agent".into(),

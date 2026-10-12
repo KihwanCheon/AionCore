@@ -12,5 +12,6 @@ pub(crate) mod image_input;
 pub(crate) mod live_tool_output;
 pub mod prompt_pipeline;
 pub(crate) mod skill_manager;
+pub(crate) mod user_choice_notice;
 
 pub use prompt_pipeline::{PostRecvHook, PreSendHook, PromptCtx, PromptPipeline};
