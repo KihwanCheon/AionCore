@@ -1051,6 +1051,50 @@ async fn update_extra_replaces_json() {
 }
 
 #[tokio::test]
+async fn atomic_extra_patch_preserves_settings_and_replaces_failed_turn() {
+    let (repo, _db) = setup().await;
+    let mut conv = make_conversation("extra-patch");
+    conv.extra =
+        r#"{"workspace":"/project","last_turn_result":{"status":"error","error":{"message":"capacity exceeded"}}}"#
+            .into();
+    repo.create(&conv).await.unwrap();
+    repo.update(
+        &conv.user_id,
+        &conv.id,
+        &ConversationRowUpdate {
+            extra_patch: Some(r#"{"last_turn_result":{"turn_id":"new-turn","status":"finish","error":null}}"#.into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let row = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["workspace"], "/project");
+    assert_eq!(extra["last_turn_result"]["status"], "finish");
+    assert!(extra["last_turn_result"].get("error").is_none());
+}
+
+#[tokio::test]
+async fn atomic_extra_patch_rejects_another_user() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("extra-patch-owner");
+    repo.create(&conv).await.unwrap();
+    let error = repo
+        .update(
+            "other-user",
+            &conv.id,
+            &ConversationRowUpdate {
+                extra_patch: Some(r#"{"last_turn_result":{"status":"error"}}"#.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, aionui_db::DbError::NotFound(_)));
+}
+
+#[tokio::test]
 async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("message-filter");

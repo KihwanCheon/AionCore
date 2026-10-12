@@ -454,6 +454,8 @@ pub struct ConversationRowUpdate {
     pub pinned_at: Option<Option<TimestampMs>>,
     pub model: Option<Option<String>>,
     pub extra: Option<String>,
+    /// Atomic JSON merge patch over `extra`, preserving concurrent unrelated keys.
+    pub extra_patch: Option<String>,
     pub status: Option<String>,
     pub updated_at: Option<TimestampMs>,
     /// Project binding (project-bind side branch); `Some` sets the column.

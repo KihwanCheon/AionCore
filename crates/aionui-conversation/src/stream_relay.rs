@@ -912,8 +912,12 @@ impl StreamRelay {
 
             self.send_system_responses(&processed.system_responses);
             outcome.system_responses = processed.system_responses;
-        } else if let AgentStreamEvent::Error(data) = event {
+        }
+        if let AgentStreamEvent::Error(data) = event {
             self.adapter.persist_error_tip(data).await;
+            self.adapter.persist_turn_result(&self.turn_id, Some(data)).await;
+        } else {
+            self.adapter.persist_turn_result(&self.turn_id, None).await;
         }
 
         outcome
@@ -1809,6 +1813,66 @@ mod tests {
         let content: serde_json::Value = serde_json::from_str(&msg.content).unwrap();
         assert_eq!(content["content"], "Something went wrong");
         assert_eq!(content["type"], "error");
+    }
+
+    #[tokio::test]
+    async fn partial_response_error_preserves_details_and_last_turn_result() {
+        let repo = Arc::new(RecordingRepo::new());
+        let bus = Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+        let (tx, rx) = broadcast::channel(8);
+        let relay = StreamRelay::new(
+            "conv-1".into(),
+            "asst-1".into(),
+            "turn-1".into(),
+            "user-1".into(),
+            repo.clone(),
+            bus,
+        );
+        tx.send(AgentStreamEvent::Text(TextEventData {
+            content: "Checking the request".into(),
+        }))
+        .unwrap();
+        tx.send(AgentStreamEvent::Error(ErrorEventData::legacy(
+            "Selected model is at capacity. Please try a different model.",
+            None,
+        )))
+        .unwrap();
+        drop(tx);
+        relay.consume(rx).await;
+
+        let rows = repo.take_inserts();
+        let tip = rows
+            .iter()
+            .find(|row| row.r#type == "tips")
+            .expect("persisted error after partial text");
+        let content: serde_json::Value = serde_json::from_str(&tip.content).unwrap();
+        assert_eq!(
+            content["error"]["message"],
+            "Selected model is at capacity. Please try a different model."
+        );
+        let updates = repo.conversation_updates.lock().unwrap();
+        let patch: serde_json::Value = serde_json::from_str(
+            updates
+                .iter()
+                .find_map(|(_, update)| update.extra_patch.as_ref())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(patch["last_turn_result"]["status"], "error");
+        assert_eq!(patch["last_turn_result"]["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn repeated_error_persistence_keeps_one_message() {
+        let repo = Arc::new(RecordingRepo::new());
+        let adapter =
+            StreamPersistenceAdapter::new("user-1".into(), "conv-1".into(), "asst-1".into(), repo.clone(), None);
+        let error = ErrorEventData::legacy("capacity exceeded", None);
+        adapter.persist_error_tip(&error).await;
+        adapter.persist_error_tip(&error).await;
+        let rows = repo.take_inserts();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, "error:conv-1:asst-1");
     }
 
     #[test]

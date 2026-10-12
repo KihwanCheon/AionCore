@@ -351,9 +351,9 @@ impl StreamPersistenceAdapter {
 
         let content = json!({ "content": &data.message, "type": "error", "error": &data }).to_string();
         let row = MessageRow {
-            id: ConversationService::mint_msg_id(),
+            id: format!("error:{}:{}", self.conversation_id, self.msg_id),
             conversation_id: self.conversation_id.clone(),
-            msg_id: None,
+            msg_id: Some(self.msg_id.clone()),
             r#type: "tips".into(),
             content,
             position: Some("left".into()),
@@ -362,8 +362,32 @@ impl StreamPersistenceAdapter {
             created_at: now_ms(),
             backend_turn_id: self.current_backend_turn_id(),
         };
-        if let Err(e) = self.repo.insert_message(&self.user_id, &row).await {
+        if let Err(e) = self.repo.upsert_message(&self.user_id, &row).await {
             log_persist_error(&e, "Failed to store error message");
+        }
+    }
+
+    /// Persist the last terminal result for history-list recovery after reconnect.
+    pub async fn persist_turn_result(&self, turn_id: &str, error: Option<&ErrorEventData>) {
+        if !self.allows_write(RuntimeWriteKind::TerminalFinalize) {
+            return;
+        }
+        let update = ConversationRowUpdate {
+            extra_patch: Some(
+                json!({
+                    "last_turn_result": {
+                        "turn_id": turn_id,
+                        "status": if error.is_some() { "error" } else { "finish" },
+                        "completed_at": now_ms(),
+                        "error": error.map(|data| data.message.as_str()),
+                    },
+                })
+                .to_string(),
+            ),
+            ..Default::default()
+        };
+        if let Err(e) = self.repo.update(&self.user_id, &self.conversation_id, &update).await {
+            log_persist_error(&e, "Failed to store conversation turn result");
         }
     }
 

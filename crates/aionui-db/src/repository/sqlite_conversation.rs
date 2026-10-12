@@ -362,7 +362,11 @@ impl IConversationRepository for SqliteConversationRepository {
             set_parts.push("model = ?".to_string());
             binds.push(BindValue::OptStr(model.clone()));
         }
-        if let Some(ref extra) = updates.extra {
+        if let Some(ref patch) = updates.extra_patch {
+            set_parts.push("extra = json_patch(COALESCE(?, extra), ?)".to_string());
+            binds.push(BindValue::OptStr(updates.extra.clone()));
+            binds.push(BindValue::Str(patch.clone()));
+        } else if let Some(ref extra) = updates.extra {
             set_parts.push("extra = ?".to_string());
             binds.push(BindValue::Str(extra.clone()));
         }

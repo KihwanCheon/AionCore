@@ -2475,6 +2475,7 @@ impl ConversationService {
             pinned_at,
             model: model_json,
             extra: merged_extra,
+            extra_patch: None,
             status: None,
             updated_at: Some(now),
             project_id: None,
@@ -4379,6 +4380,15 @@ impl ConversationService {
         let msg_id = row.msg_id.clone().unwrap_or_else(|| row.id.clone());
         let content_value: serde_json::Value =
             serde_json::from_str(&row.content).unwrap_or_else(|_| serde_json::Value::String(row.content.clone()));
+        crate::stream_persistence::StreamPersistenceAdapter::new(
+            user_id.to_owned(),
+            conversation_id.to_owned(),
+            msg_id.clone(),
+            self.conversation_repo.clone(),
+            Some(self.runtime_persistence()),
+        )
+        .persist_turn_result(turn_id, Some(err.stream_error()))
+        .await;
         self.broadcaster.broadcast(WebSocketMessage::new(
             "message.stream",
             serde_json::json!({
