@@ -21,16 +21,17 @@ use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind
 use crate::runtime_state::ConversationRuntimeStateService;
 use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
-    AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
-    ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
+    AssistantMcpBindingChanged, CancelConversationResponse, ChoiceNoticeListResponse, ChoiceNoticeResponse,
+    ChoiceNoticesChangedPayload, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
+    ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
     ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
-    assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
+    DismissChoiceNoticeRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
+    MessageSearchResponse, PromptCapabilityView, RegisterChoiceNoticeRequest, SearchMessagesQuery, SendMessageRequest,
+    SendMessageResponse, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection,
+    TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
+    assistant_avatar_response_value, assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ActiveConversationRuntime, ChatFileRef, SessionRef};
 use aionui_common::{
@@ -39,7 +40,8 @@ use aionui_common::{
     now_ms, validate_workspace_path_availability,
 };
 use aionui_db::models::{
-    AssistantDefinitionRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow, MessageRow,
+    AssistantDefinitionRow, ChoiceNoticeRow, ConversationAssistantSnapshotRow, ConversationRow, McpServerRow,
+    MessageRow,
 };
 use aionui_db::{
     AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
@@ -76,6 +78,33 @@ const ACP_CANCEL_DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 const LEGACY_CONVERSATION_ARCHIVED_MESSAGE: &str =
     "This historical conversation can no longer be continued. Please start a new conversation.";
 const DEPRECATED_AGENT_TYPE_MESSAGE: &str = "This agent type is no longer supported for new conversations.";
+const MAX_CHOICE_NOTICE_ID_LENGTH: usize = 255;
+const MAX_CHOICE_NOTICE_PREVIEW_LENGTH: usize = 320;
+
+struct ChoiceNoticeInput<'a> {
+    conversation_id: &'a str,
+    message_id: &'a str,
+    marker_index: u32,
+    preview: &'a str,
+    created_at: i64,
+}
+
+fn normalize_choice_notice_preview(preview: &str) -> String {
+    preview.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn choice_notice_row_to_response(row: ChoiceNoticeRow) -> Result<ChoiceNoticeResponse, ConversationError> {
+    let marker_index = u32::try_from(row.marker_index)
+        .map_err(|_| ConversationError::internal("Choice notification marker index is out of range"))?;
+    Ok(ChoiceNoticeResponse {
+        key: row.key,
+        conversation_id: row.conversation_id,
+        message_id: row.message_id,
+        marker_index,
+        preview: row.preview,
+        created_at: row.created_at,
+    })
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
 pub(crate) struct AssistantConversationOverrides {
@@ -3463,6 +3492,170 @@ impl ConversationService {
         Ok(response)
     }
 
+    pub async fn list_choice_notices(&self, user_id: &str) -> Result<ChoiceNoticeListResponse, ConversationError> {
+        self.conversation_repo
+            .list_choice_notices(user_id)
+            .await?
+            .into_iter()
+            .map(choice_notice_row_to_response)
+            .collect()
+    }
+
+    async fn build_choice_notice_row(
+        &self,
+        user_id: &str,
+        input: ChoiceNoticeInput<'_>,
+        status: &str,
+    ) -> Result<ChoiceNoticeRow, ConversationError> {
+        if input.conversation_id.is_empty()
+            || input.conversation_id.len() > MAX_CHOICE_NOTICE_ID_LENGTH
+            || input.message_id.is_empty()
+            || input.message_id.len() > MAX_CHOICE_NOTICE_ID_LENGTH
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "choice notification contains an invalid conversation or message id".into(),
+            });
+        }
+        if input.created_at < 0 {
+            return Err(ConversationError::BadRequest {
+                reason: "choice notification created_at must not be negative".into(),
+            });
+        }
+        let preview = normalize_choice_notice_preview(input.preview);
+        if preview.is_empty() || preview.chars().count() > MAX_CHOICE_NOTICE_PREVIEW_LENGTH {
+            return Err(ConversationError::BadRequest {
+                reason: "choice notification preview must contain 1 to 320 characters".into(),
+            });
+        }
+        self.conversation_repo
+            .get(user_id, input.conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: input.conversation_id.to_owned(),
+            })?;
+
+        let key =
+            serde_json::to_string(&(input.conversation_id, input.message_id, input.marker_index)).map_err(|error| {
+                ConversationError::internal(format!("Failed to build choice notification key: {error}"))
+            })?;
+        Ok(ChoiceNoticeRow {
+            user_id: user_id.to_owned(),
+            key,
+            conversation_id: input.conversation_id.to_owned(),
+            message_id: input.message_id.to_owned(),
+            marker_index: i64::from(input.marker_index),
+            preview,
+            status: status.to_owned(),
+            created_at: input.created_at,
+            updated_at: now_ms(),
+        })
+    }
+
+    pub async fn register_choice_notice(
+        &self,
+        user_id: &str,
+        req: RegisterChoiceNoticeRequest,
+    ) -> Result<ChoiceNoticeListResponse, ConversationError> {
+        let notice = self
+            .build_choice_notice_row(
+                user_id,
+                ChoiceNoticeInput {
+                    conversation_id: &req.conversation_id,
+                    message_id: &req.message_id,
+                    marker_index: req.marker_index,
+                    preview: &req.preview,
+                    created_at: req.created_at,
+                },
+                "pending",
+            )
+            .await?;
+        self.conversation_repo.upsert_choice_notice(&notice).await?;
+
+        let items = self.list_choice_notices(user_id).await?;
+        info!(
+            user_id,
+            conversation_id = %req.conversation_id,
+            message_id = %req.message_id,
+            marker_index = req.marker_index,
+            pending_count = items.len(),
+            "Choice notification state synchronized"
+        );
+        self.broadcast_choice_notices(user_id, &items)?;
+        Ok(items)
+    }
+
+    pub async fn dismiss_choice_notice(
+        &self,
+        user_id: &str,
+        req: DismissChoiceNoticeRequest,
+    ) -> Result<ChoiceNoticeListResponse, ConversationError> {
+        let notice = self
+            .build_choice_notice_row(
+                user_id,
+                ChoiceNoticeInput {
+                    conversation_id: &req.conversation_id,
+                    message_id: &req.message_id,
+                    marker_index: req.marker_index,
+                    preview: &req.preview,
+                    created_at: req.created_at,
+                },
+                "dismissed",
+            )
+            .await?;
+        let changed = self.conversation_repo.dismiss_choice_notice(&notice).await?;
+        let items = self.list_choice_notices(user_id).await?;
+        if changed {
+            info!(user_id, pending_count = items.len(), "Choice notification dismissed");
+            self.broadcast_choice_notices(user_id, &items)?;
+        }
+        Ok(items)
+    }
+
+    fn broadcast_choice_notices(
+        &self,
+        user_id: &str,
+        items: &ChoiceNoticeListResponse,
+    ) -> Result<(), ConversationError> {
+        let payload = serde_json::to_value(ChoiceNoticesChangedPayload {
+            user_id: user_id.to_owned(),
+            items: items.clone(),
+        })
+        .map_err(|error| {
+            ConversationError::internal(format!("Failed to serialize choice notification event: {error}"))
+        })?;
+        self.broadcaster
+            .broadcast(WebSocketMessage::new("conversation.choiceNoticesChanged", payload));
+        Ok(())
+    }
+
+    async fn resolve_choice_notices_after_user_message(&self, user_id: &str, conversation_id: &str) {
+        match self
+            .conversation_repo
+            .resolve_choice_notices(user_id, conversation_id, now_ms())
+            .await
+        {
+            Ok(0) => {}
+            Ok(resolved_count) => match self.list_choice_notices(user_id).await {
+                Ok(items) => {
+                    info!(
+                        user_id,
+                        conversation_id,
+                        resolved_count,
+                        pending_count = items.len(),
+                        "Choice notifications resolved by user message"
+                    );
+                    if let Err(error) = self.broadcast_choice_notices(user_id, &items) {
+                        warn!(conversation_id, error = %error, "Failed to broadcast resolved choice notifications");
+                    }
+                }
+                Err(error) => {
+                    warn!(conversation_id, error = %error, "Failed to reload resolved choice notifications")
+                }
+            },
+            Err(error) => warn!(conversation_id, error = %error, "Failed to resolve choice notifications"),
+        }
+    }
+
     /// Search messages across all conversations for the user.
     pub async fn search_messages(
         &self,
@@ -3800,11 +3993,16 @@ impl ConversationService {
                     "client_msg_id": &user_msg_id,
                     "content": &resolved.content,
                     "position": "right",
+                    "source": "user",
                     "status": MIDTURN_STATUS_QUEUED,
                     "hidden": hidden,
                     "created_at": user_msg.created_at,
                 }),
             ));
+            if !hidden {
+                self.resolve_choice_notices_after_user_message(user_id, conversation_id)
+                    .await;
+            }
         }
         let data = aionui_ai_agent::types::SendMessageData {
             content: resolved.content.clone(),
@@ -4078,11 +4276,16 @@ impl ConversationService {
                     "msg_id": &user_msg_id,
                     "content": &resolved.content,
                     "position": "right",
+                    "source": "user",
                     "status": "finish",
                     "hidden": req.hidden,
                     "created_at": user_msg.created_at,
                 }),
             ));
+            if !req.hidden {
+                self.resolve_choice_notices_after_user_message(user_id, conversation_id)
+                    .await;
+            }
         }
 
         // Build task options from conversation row
@@ -4228,6 +4431,7 @@ impl ConversationService {
                         "msg_id": &user_msg.id,
                         "content": &request.content,
                         "position": "right",
+                        "source": "agent_turn",
                         "status": "finish",
                         "hidden": false,
                         "created_at": user_msg.created_at,

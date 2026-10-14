@@ -925,3 +925,136 @@ async fn t2_3b_runtime_ensure_legacy_workspace_with_whitespace_succeeds() {
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ── User-choice notification synchronization ───────────────────────
+
+#[tokio::test]
+async fn choice_notifications_require_authentication() {
+    let (app, _services) = build_app().await;
+
+    let resp = app.oneshot(get_request("/api/choice-notifications")).await.unwrap();
+
+    assert!(matches!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+    ));
+}
+
+#[tokio::test]
+async fn choice_notification_writes_require_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, _csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/choice-notifications")
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(
+            serde_json::to_vec(&json!({
+                "conversation_id": "conversation-1",
+                "message_id": "message-1",
+                "marker_index": 0,
+                "preview": "Choose one",
+                "created_at": 1,
+            }))
+            .unwrap(),
+        ))
+        .unwrap();
+
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn choice_notifications_are_shared_with_the_same_user_and_isolated_from_other_users() {
+    let (mut app, services) = build_app().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conversation_id = create_conversation(&mut app, &owner_token, &owner_csrf, "Shared choice notifications").await;
+    let register_body = json!({
+        "conversation_id": conversation_id,
+        "message_id": "assistant-message-1",
+        "marker_index": 0,
+        "preview": "Choose one",
+        "created_at": aionui_common::now_ms(),
+    });
+
+    let register_resp = app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/choice-notifications",
+            register_body.clone(),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(register_resp.status(), StatusCode::OK);
+    let register_json = body_json(register_resp).await;
+    assert_eq!(register_json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(register_json["data"][0]["preview"], "Choose one");
+
+    let owner_list_resp = app
+        .clone()
+        .oneshot(get_with_token("/api/choice-notifications", &owner_token))
+        .await
+        .unwrap();
+    assert_eq!(owner_list_resp.status(), StatusCode::OK);
+    let owner_list_json = body_json(owner_list_resp).await;
+    assert_eq!(owner_list_json["data"], register_json["data"]);
+
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "other", "StrongP@ss2").await;
+    let other_list_resp = app
+        .clone()
+        .oneshot(get_with_token("/api/choice-notifications", &other_token))
+        .await
+        .unwrap();
+    assert_eq!(other_list_resp.status(), StatusCode::OK);
+    assert!(body_json(other_list_resp).await["data"].as_array().unwrap().is_empty());
+
+    let cross_user_register_resp = app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/choice-notifications",
+            register_body.clone(),
+            &other_token,
+            &other_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(cross_user_register_resp.status(), StatusCode::NOT_FOUND);
+
+    let dismiss_resp = app
+        .clone()
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/choice-notifications/dismiss",
+            register_body.clone(),
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(dismiss_resp.status(), StatusCode::OK);
+    assert!(body_json(dismiss_resp).await["data"].as_array().unwrap().is_empty());
+
+    let delayed_register_resp = app
+        .oneshot(common::json_with_token(
+            "POST",
+            "/api/choice-notifications",
+            register_body,
+            &owner_token,
+            &owner_csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(delayed_register_resp.status(), StatusCode::OK);
+    assert!(
+        body_json(delayed_register_resp).await["data"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

@@ -66,6 +66,20 @@ pub struct ConversationAssistantSnapshotRow {
     pub updated_at: TimestampMs,
 }
 
+/// Server-owned state for one explicit user-choice notification.
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow, PartialEq, Eq)]
+pub struct ChoiceNoticeRow {
+    pub user_id: String,
+    pub key: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub marker_index: i64,
+    pub preview: String,
+    pub status: String,
+    pub created_at: TimestampMs,
+    pub updated_at: TimestampMs,
+}
+
 /// Insert-or-update parameters for `conversation_assistant_snapshots`.
 #[derive(Debug, Clone)]
 pub struct UpsertConversationAssistantSnapshotParams<'a> {

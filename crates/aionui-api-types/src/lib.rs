@@ -101,14 +101,16 @@ pub use conversation::ReloadConversationMcpServersRequest;
 pub use conversation::{ActiveConversationRuntime, ActiveConversationRuntimesResponse};
 pub use conversation::{
     ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
-    CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
-    ConversationAssistantIdentityResponse, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    CancelConversationRequest, CancelConversationResponse, ChoiceNoticeListResponse, ChoiceNoticeResponse,
+    ChoiceNoticesChangedPayload, CloneConversationRequest, ConversationArtifactKind, ConversationArtifactListResponse,
+    ConversationArtifactResponse, ConversationArtifactStatus, ConversationAssistantIdentityResponse,
+    ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind, ConversationNameUpdatedPayload,
+    ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary, CreateConversationRequest,
+    DismissChoiceNoticeRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
     ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView,
+    RegisterChoiceNoticeRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use conversation::{
     ConversationRuntimeConfigResponse, ConversationRuntimeConfigSource, ConversationRuntimeConfigValue,

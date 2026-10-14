@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
 use crate::models::{
-    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
+    ChoiceNoticeRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
     UpsertConversationAssistantSnapshotParams,
 };
 
@@ -129,6 +129,29 @@ pub trait IConversationRepository: Send + Sync {
     /// Deletes the assistant snapshot bound to a conversation.
     async fn delete_assistant_snapshot(&self, _user_id: &str, _conversation_id: &str) -> Result<bool, DbError> {
         Ok(false)
+    }
+
+    // ── User-choice notification state ─────────────────────────────
+
+    async fn list_choice_notices(&self, _user_id: &str) -> Result<Vec<ChoiceNoticeRow>, DbError> {
+        Ok(Vec::new())
+    }
+
+    async fn upsert_choice_notice(&self, _notice: &ChoiceNoticeRow) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    async fn dismiss_choice_notice(&self, _notice: &ChoiceNoticeRow) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
+    async fn resolve_choice_notices(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _updated_at: TimestampMs,
+    ) -> Result<u64, DbError> {
+        Ok(0)
     }
 
     // ── Message operations ──────────────────────────────────────────

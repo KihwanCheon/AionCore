@@ -24,16 +24,17 @@ use aionui_api_types::{
     GetModelInfoResponse, ModelInfoEntry, ModelInfoPayload, SetConfigOptionRequest, SetConfigOptionResponse,
 };
 use aionui_api_types::{
-    CloneConversationRequest, CreateConversationRequest, ListConversationsQuery, ReloadConversationMcpServersRequest,
-    SearchMessagesQuery, SendMessageRequest, UpdateConversationRequest, WebSocketMessage,
+    CloneConversationRequest, CreateConversationRequest, DismissChoiceNoticeRequest, ListConversationsQuery,
+    RegisterChoiceNoticeRequest, ReloadConversationMcpServersRequest, SearchMessagesQuery, SendMessageRequest,
+    UpdateConversationRequest, WebSocketMessage,
 };
 use aionui_common::{
     AgentKillReason, AgentType, Confirmation, ConversationSource, ConversationStatus, PaginatedResult,
     ProviderWithModel, TimestampMs,
 };
 use aionui_db::models::{
-    AcpSessionRow, AgentMetadataRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow,
-    MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
+    AcpSessionRow, AgentMetadataRow, ChoiceNoticeRow, ConversationArtifactRow, ConversationAssistantSnapshotRow,
+    ConversationRow, MessageRow, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, DbError, IAcpSessionRepository,
@@ -234,6 +235,7 @@ impl AgentAvailabilityFeedbackPort for RecordingAvailabilityFeedback {
 struct MockRepo {
     rows: Mutex<Vec<ConversationRow>>,
     messages: Mutex<Vec<MessageRow>>,
+    choice_notices: Mutex<Vec<ChoiceNoticeRow>>,
     artifacts: Mutex<Vec<ConversationArtifactRow>>,
     assistant_snapshots: Mutex<Vec<ConversationAssistantSnapshotRow>>,
 }
@@ -243,6 +245,7 @@ impl MockRepo {
         Self {
             rows: Mutex::new(vec![]),
             messages: Mutex::new(vec![]),
+            choice_notices: Mutex::new(vec![]),
             artifacts: Mutex::new(vec![]),
             assistant_snapshots: Mutex::new(vec![]),
         }
@@ -439,6 +442,80 @@ impl IConversationRepository for MockRepo {
         let before = rows.len();
         rows.retain(|row| row.conversation_id != conversation_id);
         Ok(rows.len() != before)
+    }
+
+    async fn list_choice_notices(&self, user_id: &str) -> Result<Vec<ChoiceNoticeRow>, aionui_db::DbError> {
+        let mut rows = self
+            .choice_notices
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| row.user_id == user_id && row.status == "pending")
+            .cloned()
+            .collect::<Vec<_>>();
+        rows.sort_by(|left, right| (left.created_at, &left.key).cmp(&(right.created_at, &right.key)));
+        Ok(rows)
+    }
+
+    async fn upsert_choice_notice(&self, notice: &ChoiceNoticeRow) -> Result<(), aionui_db::DbError> {
+        let mut rows = self.choice_notices.lock().unwrap();
+        if rows
+            .iter()
+            .any(|row| row.user_id == notice.user_id && row.key == notice.key && row.status != "pending")
+        {
+            return Ok(());
+        }
+        for row in rows.iter_mut().filter(|row| {
+            row.user_id == notice.user_id
+                && row.conversation_id == notice.conversation_id
+                && row.preview == notice.preview
+                && row.message_id != notice.message_id
+                && row.key != notice.key
+                && row.status == "pending"
+        }) {
+            row.status = "superseded".into();
+        }
+        rows.retain(|row| !(row.user_id == notice.user_id && row.key == notice.key));
+        rows.push(notice.clone());
+        Ok(())
+    }
+
+    async fn dismiss_choice_notice(&self, notice: &ChoiceNoticeRow) -> Result<bool, aionui_db::DbError> {
+        let mut rows = self.choice_notices.lock().unwrap();
+        if let Some(row) = rows
+            .iter_mut()
+            .find(|row| row.user_id == notice.user_id && row.key == notice.key)
+        {
+            if row.status != "pending" {
+                return Ok(false);
+            }
+            row.status = "dismissed".into();
+            row.updated_at = notice.updated_at;
+            return Ok(true);
+        }
+        let mut dismissed = notice.clone();
+        dismissed.status = "dismissed".into();
+        rows.push(dismissed);
+        Ok(true)
+    }
+
+    async fn resolve_choice_notices(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        updated_at: i64,
+    ) -> Result<u64, aionui_db::DbError> {
+        let mut rows = self.choice_notices.lock().unwrap();
+        let mut changed = 0;
+        for row in rows
+            .iter_mut()
+            .filter(|row| row.user_id == user_id && row.conversation_id == conversation_id && row.status == "pending")
+        {
+            row.status = "resolved".into();
+            row.updated_at = updated_at;
+            changed += 1;
+        }
+        Ok(changed)
     }
 
     async fn list_messages_page(
@@ -4396,7 +4473,8 @@ async fn midturn_send_delivers_into_the_active_turn() {
     assert!(response.delivered_midturn, "response flags the mid-turn delivery");
     let delivered = agent.delivered.lock().unwrap().clone();
     assert_eq!(delivered.len(), 1, "delivered through the mid-turn path exactly once");
-    assert_eq!(delivered[0].content, "Hello");
+    assert!(delivered[0].content.starts_with("Hello\n\n"));
+    assert!(delivered[0].content.contains("[[AIONUI_USER_CHOICE_REQUIRED]]"));
     assert_eq!(
         delivered[0].msg_id, response.msg_id,
         "the wire correlation id IS the persisted msg_id"
@@ -4414,6 +4492,7 @@ async fn midturn_send_delivers_into_the_active_turn() {
         .find(|e| e.name == "message.userCreated")
         .expect("userCreated broadcast");
     assert_eq!(created.data["client_msg_id"], response.msg_id.as_str());
+    assert_eq!(created.data["source"], "user");
     assert_eq!(created.data["status"], "pending");
     // Persisted with the pending-receipt status.
     let rows: Vec<_> = repo
@@ -4676,6 +4755,7 @@ async fn run_agent_turn_broadcasts_visible_user_message_and_list_change() {
         .expect("visible agent turn should broadcast its user message");
     assert_eq!(user_created.data["conversation_id"], conv.id);
     assert_eq!(user_created.data["content"], "delegated card work");
+    assert_eq!(user_created.data["source"], "agent_turn");
     assert_eq!(user_created.data["hidden"], false);
 
     let list_changed = events
@@ -6349,6 +6429,130 @@ async fn send_message_broadcasts_user_created_event() {
     assert_eq!(user_created.data["msg_id"], response.msg_id);
     assert_eq!(user_created.data["content"], "Hello");
     assert_eq!(user_created.data["position"], "right");
+    assert_eq!(user_created.data["source"], "user");
+}
+
+#[tokio::test]
+async fn choice_notice_snapshot_is_broadcast_and_resolved_by_a_visible_user_message() {
+    let (svc, broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    broadcaster.take_events();
+
+    let pending = svc
+        .register_choice_notice(
+            "user_1",
+            RegisterChoiceNoticeRequest {
+                conversation_id: conv.id.clone(),
+                message_id: "assistant-message".into(),
+                marker_index: 0,
+                preview: "  Restart   now? ".into(),
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].preview, "Restart now?");
+    assert!(broadcaster.take_events().iter().any(|event| {
+        event.name == "conversation.choiceNoticesChanged" && event.data["items"].as_array().unwrap().len() == 1
+    }));
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+    assert!(svc.list_choice_notices("user_1").await.unwrap().is_empty());
+    assert!(broadcaster.take_events().iter().any(|event| {
+        event.name == "conversation.choiceNoticesChanged" && event.data["items"].as_array().unwrap().is_empty()
+    }));
+}
+
+#[tokio::test]
+async fn hidden_user_message_does_not_resolve_choice_notices() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    svc.register_choice_notice(
+        "user_1",
+        RegisterChoiceNoticeRequest {
+            conversation_id: conv.id.clone(),
+            message_id: "assistant-message".into(),
+            marker_index: 0,
+            preview: "Restart now?".into(),
+            created_at: 1,
+        },
+    )
+    .await
+    .unwrap();
+
+    let mut request = make_send_req();
+    request.hidden = true;
+    svc.send_message("user_1", &conv.id, request, &task_mgr).await.unwrap();
+    assert_eq!(svc.list_choice_notices("user_1").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn dismissal_before_delayed_registration_creates_a_durable_tombstone() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let request = RegisterChoiceNoticeRequest {
+        conversation_id: conv.id,
+        message_id: "assistant-message".into(),
+        marker_index: 0,
+        preview: "Restart now?".into(),
+        created_at: 1,
+    };
+
+    svc.dismiss_choice_notice(
+        "user_1",
+        DismissChoiceNoticeRequest {
+            conversation_id: request.conversation_id.clone(),
+            message_id: request.message_id.clone(),
+            marker_index: request.marker_index,
+            preview: request.preview.clone(),
+            created_at: request.created_at,
+        },
+    )
+    .await
+    .unwrap();
+    svc.register_choice_notice("user_1", request).await.unwrap();
+
+    assert!(svc.list_choice_notices("user_1").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn registering_choice_notice_rejects_invalid_or_foreign_input() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let invalid = svc
+        .register_choice_notice(
+            "user_1",
+            RegisterChoiceNoticeRequest {
+                conversation_id: conv.id.clone(),
+                message_id: "assistant-message".into(),
+                marker_index: 0,
+                preview: "   ".into(),
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(invalid, ConversationError::BadRequest { .. }));
+
+    let foreign = svc
+        .register_choice_notice(
+            "user_2",
+            RegisterChoiceNoticeRequest {
+                conversation_id: conv.id,
+                message_id: "assistant-message".into(),
+                marker_index: 0,
+                preview: "Restart now?".into(),
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(foreign, ConversationError::NotFound { .. }));
 }
 
 #[tokio::test]

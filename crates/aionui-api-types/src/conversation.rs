@@ -343,6 +343,26 @@ pub struct UpdateConversationArtifactRequest {
     pub status: ConversationArtifactStatus,
 }
 
+/// Body for `POST /api/choice-notifications`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct RegisterChoiceNoticeRequest {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub marker_index: u32,
+    pub preview: String,
+    pub created_at: TimestampMs,
+}
+
+/// Body for `POST /api/choice-notifications/dismiss`.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct DismissChoiceNoticeRequest {
+    pub conversation_id: String,
+    pub message_id: String,
+    pub marker_index: u32,
+    pub preview: String,
+    pub created_at: TimestampMs,
+}
+
 /// Query parameters for `GET /api/messages/search`.
 #[derive(Debug, Deserialize)]
 pub struct SearchMessagesQuery {
@@ -476,6 +496,26 @@ pub struct ConversationArtifactResponse {
 
 /// List of conversation artifacts for a single conversation.
 pub type ConversationArtifactListResponse = Vec<ConversationArtifactResponse>;
+
+/// One pending prose-choice notification shared by all clients for a user.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChoiceNoticeResponse {
+    pub key: String,
+    pub conversation_id: String,
+    pub message_id: String,
+    pub marker_index: u32,
+    pub preview: String,
+    pub created_at: TimestampMs,
+}
+
+pub type ChoiceNoticeListResponse = Vec<ChoiceNoticeResponse>;
+
+/// Full authoritative snapshot emitted after choice-notification state changes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChoiceNoticesChangedPayload {
+    pub user_id: String,
+    pub items: ChoiceNoticeListResponse,
+}
 
 /// Payload of the `conversation.nameUpdated` websocket event, emitted when an
 /// agent-generated session title is applied to a conversation.
@@ -696,6 +736,39 @@ mod tests {
         let raw = json!({ "status": "dismissed" });
         let req: UpdateConversationArtifactRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.status, ConversationArtifactStatus::Dismissed);
+    }
+
+    #[test]
+    fn choice_notice_contract_round_trips() {
+        let notice = ChoiceNoticeResponse {
+            key: r#"["conversation-a","message-a",0]"#.into(),
+            conversation_id: "conversation-a".into(),
+            message_id: "message-a".into(),
+            marker_index: 0,
+            preview: "Restart now?".into(),
+            created_at: 100,
+        };
+        let payload = ChoiceNoticesChangedPayload {
+            user_id: "user-a".into(),
+            items: vec![notice],
+        };
+        let value = serde_json::to_value(&payload).unwrap();
+        assert_eq!(value["items"][0]["marker_index"], 0);
+        assert_eq!(
+            serde_json::from_value::<ChoiceNoticesChangedPayload>(value).unwrap(),
+            payload
+        );
+
+        let dismiss: DismissChoiceNoticeRequest = serde_json::from_value(serde_json::json!({
+            "conversation_id": "conversation-a",
+            "message_id": "message-a",
+            "marker_index": 0,
+            "preview": "Restart now?",
+            "created_at": 100,
+        }))
+        .unwrap();
+        assert_eq!(dismiss.conversation_id, "conversation-a");
+        assert_eq!(dismiss.message_id, "message-a");
     }
 
     // ── CloneConversationRequest ────────────────────────────────────

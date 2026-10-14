@@ -1,7 +1,7 @@
 use aionui_db::{
     ConversationFilters, ConversationRowUpdate, DbError, IConversationRepository, MessagePageCursor,
     MessagePageDirection, MessagePageParams, MessageRowUpdate, SqliteConversationRepository, init_database_memory,
-    models::ConversationRow, models::MessageRow,
+    models::ChoiceNoticeRow, models::ConversationRow, models::MessageRow,
 };
 
 const USER_ID: &str = "system_default_user";
@@ -76,6 +76,26 @@ fn make_artifact(conv_id: &str, artifact_id: &str) -> aionui_db::ConversationArt
         .to_string(),
         created_at: 1000,
         updated_at: 1000,
+    }
+}
+
+fn make_choice_notice(
+    user_id: &str,
+    conv_id: &str,
+    message_id: &str,
+    preview: &str,
+    created_at: i64,
+) -> ChoiceNoticeRow {
+    ChoiceNoticeRow {
+        user_id: user_id.to_owned(),
+        key: serde_json::to_string(&(conv_id, message_id, 0)).unwrap(),
+        conversation_id: conv_id.to_owned(),
+        message_id: message_id.to_owned(),
+        marker_index: 0,
+        preview: preview.to_owned(),
+        status: "pending".to_owned(),
+        created_at,
+        updated_at: created_at,
     }
 }
 
@@ -1506,4 +1526,74 @@ async fn resolve_backend_turn_anchor_is_user_scoped() {
         .await
         .unwrap();
     assert_eq!(anchor, None, "foreign conversations must resolve to nothing");
+}
+
+#[tokio::test]
+async fn choice_notices_are_user_scoped_and_keep_only_the_newest_identical_question() {
+    let (repo, db) = setup().await;
+    let conv = make_conversation("choice-owner");
+    repo.create(&conv).await.unwrap();
+    create_user_2(&db).await;
+    let mut foreign_conv = make_conversation("choice-foreign");
+    foreign_conv.user_id = "user_2".to_owned();
+    repo.create(&foreign_conv).await.unwrap();
+
+    let old = make_choice_notice(USER_ID, &conv.id, "message-a", "Restart now?", 100);
+    let newest = make_choice_notice(USER_ID, &conv.id, "message-b", "Restart now?", 200);
+    let mut newest_second_marker = make_choice_notice(USER_ID, &conv.id, "message-b", "Restart now?", 201);
+    newest_second_marker.marker_index = 1;
+    newest_second_marker.key = format!(r#"["{}","message-b",1]"#, conv.id);
+    let foreign = make_choice_notice("user_2", &foreign_conv.id, "message-c", "Foreign", 300);
+    repo.upsert_choice_notice(&old).await.unwrap();
+    repo.upsert_choice_notice(&newest).await.unwrap();
+    repo.upsert_choice_notice(&newest_second_marker).await.unwrap();
+    repo.upsert_choice_notice(&foreign).await.unwrap();
+    repo.upsert_choice_notice(&old).await.unwrap();
+
+    let pending = repo.list_choice_notices(USER_ID).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending.iter().all(|notice| notice.message_id == "message-b"));
+    assert_eq!(
+        pending.iter().map(|notice| notice.marker_index).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+}
+
+#[tokio::test]
+async fn dismissed_and_answered_choice_notices_do_not_reappear() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("choice-lifecycle");
+    repo.create(&conv).await.unwrap();
+
+    let dismissed = make_choice_notice(USER_ID, &conv.id, "message-a", "Restart now?", 100);
+    assert!(repo.dismiss_choice_notice(&dismissed).await.unwrap());
+    repo.upsert_choice_notice(&dismissed).await.unwrap();
+    assert!(repo.list_choice_notices(USER_ID).await.unwrap().is_empty());
+
+    let mut answer = make_message(&conv.id, "Proceed");
+    answer.created_at = 400;
+    repo.insert_message(USER_ID, &answer).await.unwrap();
+    let delayed = make_choice_notice(USER_ID, &conv.id, "message-b", "Deploy now?", 300);
+    repo.upsert_choice_notice(&delayed).await.unwrap();
+    assert!(repo.list_choice_notices(USER_ID).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn resolving_a_conversation_keeps_other_conversations_pending() {
+    let (repo, _db) = setup().await;
+    let first = make_conversation("choice-first");
+    let second = make_conversation("choice-second");
+    repo.create(&first).await.unwrap();
+    repo.create(&second).await.unwrap();
+    repo.upsert_choice_notice(&make_choice_notice(USER_ID, &first.id, "message-a", "First?", 100))
+        .await
+        .unwrap();
+    repo.upsert_choice_notice(&make_choice_notice(USER_ID, &second.id, "message-b", "Second?", 200))
+        .await
+        .unwrap();
+
+    assert_eq!(repo.resolve_choice_notices(USER_ID, &first.id, 300).await.unwrap(), 1);
+    let pending = repo.list_choice_notices(USER_ID).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].conversation_id, second.id);
 }

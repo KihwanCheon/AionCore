@@ -9,12 +9,12 @@ use axum::routing::{get, patch, post, put};
 use aionui_api_types::ActiveConversationRuntimesResponse;
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
-    CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
-    ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
-    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse,
-    ReloadConversationMcpServersRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    UpdateConversationArtifactRequest, UpdateConversationRequest,
+    CancelConversationResponse, ChoiceNoticeListResponse, CloneConversationRequest, ConfirmRequest,
+    ConfirmationListResponse, ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse,
+    ConversationResponse, CreateConversationRequest, DismissChoiceNoticeRequest, EnsureConversationRuntimeResponse,
+    ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
+    MessageSearchResponse, RegisterChoiceNoticeRequest, ReloadConversationMcpServersRequest, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::{ApiError, now_ms};
@@ -119,6 +119,11 @@ impl From<ConversationError> for ApiError {
 /// All routes require authentication (applied by the caller).
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
+        .route(
+            "/api/choice-notifications",
+            get(list_choice_notices).post(register_choice_notice),
+        )
+        .route("/api/choice-notifications/dismiss", post(dismiss_choice_notice))
         .route("/api/conversations", post(create).get(list))
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/mcp-servers", put(reload_mcp_servers))
@@ -154,6 +159,46 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
+
+async fn list_choice_notices(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<ChoiceNoticeListResponse>>, ApiError> {
+    let result = state
+        .service
+        .list_choice_notices(&user.id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn register_choice_notice(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<RegisterChoiceNoticeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ChoiceNoticeListResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let result = state
+        .service
+        .register_choice_notice(&user.id, req)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn dismiss_choice_notice(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    body: Result<Json<DismissChoiceNoticeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ChoiceNoticeListResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let result = state
+        .service
+        .dismiss_choice_notice(&user.id, req)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
 
 async fn create(
     State(state): State<ConversationRouterState>,
