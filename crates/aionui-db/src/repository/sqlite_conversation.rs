@@ -7,6 +7,7 @@ use crate::models::{
     ChoiceNoticeRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
     UpsertConversationAssistantSnapshotParams,
 };
+use crate::repository::begin_immediate;
 use crate::repository::conversation::{
     ConversationFilters, ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams,
     MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
@@ -55,8 +56,7 @@ impl SqliteConversationRepository {
         // `claim_run`) so concurrent inserters queue on SQLite's busy handler
         // instead of a read-then-write transaction failing with "database is
         // locked" when it tries to upgrade to the write lock.
-        let mut connection = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let mut transaction = begin_immediate(&self.pool).await?;
 
         let result: Result<(), DbError> = async {
             // Ownership check inside the same transaction as the insert +
@@ -65,7 +65,7 @@ impl SqliteConversationRepository {
                 sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
                     .bind(user_id)
                     .bind(&message.conversation_id)
-                    .fetch_one(&mut *connection)
+                    .fetch_one(&mut *transaction)
                     .await?;
             if exists == 0 {
                 return Err(DbError::NotFound(format!(
@@ -89,7 +89,7 @@ impl SqliteConversationRepository {
             .bind(message.hidden)
             .bind(message.created_at)
             .bind(&message.backend_turn_id)
-            .execute(&mut *connection)
+            .execute(&mut *transaction)
             .await?;
 
             // Persisting a message bumps the parent conversation's recency so
@@ -98,7 +98,7 @@ impl SqliteConversationRepository {
             sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
                 .bind(message.created_at)
                 .bind(&message.conversation_id)
-                .execute(&mut *connection)
+                .execute(&mut *transaction)
                 .await?;
             Ok(())
         }
@@ -106,11 +106,11 @@ impl SqliteConversationRepository {
 
         match result {
             Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                transaction.commit().await?;
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -118,8 +118,7 @@ impl SqliteConversationRepository {
 
     async fn upsert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
         // Writer-lock-first transaction; see `insert_message_once` for why.
-        let mut connection = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let mut transaction = begin_immediate(&self.pool).await?;
 
         let result: Result<(), DbError> = async {
             let result = sqlx::query(
@@ -169,7 +168,7 @@ impl SqliteConversationRepository {
             .bind(message.created_at)
             .bind(&message.backend_turn_id)
             .bind(user_id)
-            .execute(&mut *connection)
+            .execute(&mut *transaction)
             .await?;
 
             // 0 rows: either the id exists under another conversation, or the
@@ -185,7 +184,7 @@ impl SqliteConversationRepository {
             sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
                 .bind(message.created_at)
                 .bind(&message.conversation_id)
-                .execute(&mut *connection)
+                .execute(&mut *transaction)
                 .await?;
             Ok(())
         }
@@ -193,11 +192,11 @@ impl SqliteConversationRepository {
 
         match result {
             Ok(()) => {
-                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                transaction.commit().await?;
                 Ok(())
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -1244,8 +1243,7 @@ impl IConversationRepository for SqliteConversationRepository {
         let (cursor_created_at, cursor_id) = cursor;
 
         // Writer-lock-first transaction; see `insert_message_once` for why.
-        let mut connection = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let mut transaction = begin_immediate(&self.pool).await?;
 
         let result: Result<u64, DbError> = async {
             // Both endpoints must belong to the caller; checked inside the
@@ -1255,7 +1253,7 @@ impl IConversationRepository for SqliteConversationRepository {
                     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
                         .bind(user_id)
                         .bind(conv_id)
-                        .fetch_one(&mut *connection)
+                        .fetch_one(&mut *transaction)
                         .await?;
                 if exists == 0 {
                     return Err(DbError::NotFound(format!("Conversation '{conv_id}' not found")));
@@ -1272,7 +1270,7 @@ impl IConversationRepository for SqliteConversationRepository {
             .bind(cursor_created_at)
             .bind(cursor_created_at)
             .bind(cursor_id)
-            .fetch_all(&mut *connection)
+            .fetch_all(&mut *transaction)
             .await?;
 
             let mut copied: u64 = 0;
@@ -1296,7 +1294,7 @@ impl IConversationRepository for SqliteConversationRepository {
                 .bind(&row.status)
                 .bind(row.hidden)
                 .bind(row.created_at)
-                .execute(&mut *connection)
+                .execute(&mut *transaction)
                 .await?;
                 copied += 1;
                 latest_created_at = Some(row.created_at);
@@ -1308,7 +1306,7 @@ impl IConversationRepository for SqliteConversationRepository {
                 sqlx::query("UPDATE conversations SET updated_at = MAX(updated_at, ?) WHERE id = ?")
                     .bind(bump)
                     .bind(target_conversation_id)
-                    .execute(&mut *connection)
+                    .execute(&mut *transaction)
                     .await?;
             }
 
@@ -1318,11 +1316,11 @@ impl IConversationRepository for SqliteConversationRepository {
 
         match result {
             Ok(copied) => {
-                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                transaction.commit().await?;
                 Ok(copied)
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }
@@ -1796,6 +1794,13 @@ async fn execute_count(pool: &SqlitePool, sql: &str, binds: &[BindValue]) -> Res
 
 #[cfg(test)]
 mod tests {
+    use std::future::pending;
+    use std::time::Duration;
+
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
     use super::*;
     use crate::init_database_memory;
 
@@ -1844,6 +1849,36 @@ mod tests {
     }
 
     const SYSTEM_USER_ID: &str = "system_default_user";
+
+    #[tokio::test]
+    async fn cancelled_immediate_transaction_rolls_back_before_pool_reuse() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let task_pool = pool.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _transaction = begin_immediate(&task_pool).await.unwrap();
+            started_tx.send(()).unwrap();
+            pending::<()>().await;
+        });
+
+        started_rx.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let mut transaction = timeout(Duration::from_secs(1), begin_immediate(&pool))
+            .await
+            .expect("pooled connection should be reusable after cancellation")
+            .expect("a cancelled transaction must not remain open");
+        sqlx::query("CREATE TABLE cancellation_probe (id INTEGER PRIMARY KEY)")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        transaction.commit().await.unwrap();
+    }
 
     // ── Conversation CRUD tests ─────────────────────────────────────
 

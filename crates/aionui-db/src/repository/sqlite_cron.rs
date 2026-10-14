@@ -3,6 +3,7 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::CronJobRow;
+use crate::repository::begin_immediate;
 use crate::repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, ICronRepository, RecoverableCronRun,
     UpdateCronJobParams,
@@ -161,8 +162,7 @@ impl ICronRepository for SqliteCronRepository {
     }
 
     async fn claim_run(&self, params: &ClaimCronRunParams<'_>) -> Result<CronRunClaimResult, DbError> {
-        let mut connection = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
+        let mut transaction = begin_immediate(&self.pool).await?;
 
         let result = async {
             let job_has_owner: bool = sqlx::query_scalar(
@@ -172,7 +172,7 @@ impl ICronRepository for SqliteCronRepository {
                 )",
             )
             .bind(params.job_id)
-            .fetch_one(&mut *connection)
+            .fetch_one(&mut *transaction)
             .await?;
             if !job_has_owner {
                 return Ok(CronRunClaimResult::Duplicate);
@@ -183,7 +183,7 @@ impl ICronRepository for SqliteCronRepository {
             )
             .bind(params.job_id)
             .bind(params.scheduled_at)
-            .fetch_optional(&mut *connection)
+            .fetch_optional(&mut *transaction)
             .await?;
 
             if let Some((status, _owner_id, lease_until)) = existing {
@@ -202,7 +202,7 @@ impl ICronRepository for SqliteCronRepository {
                     .bind(params.job_id)
                     .bind(params.scheduled_at)
                     .bind(params.now)
-                    .execute(&mut *connection)
+                    .execute(&mut *transaction)
                     .await?;
                     return Ok(if updated.rows_affected() == 1 {
                         CronRunClaimResult::Claimed
@@ -220,7 +220,7 @@ impl ICronRepository for SqliteCronRepository {
                 )
                 .bind(params.job_id)
                 .bind(params.now)
-                .fetch_one(&mut *connection)
+                .fetch_one(&mut *transaction)
                 .await?;
 
                 if has_active_run {
@@ -234,7 +234,7 @@ impl ICronRepository for SqliteCronRepository {
                     .bind(params.now)
                     .bind(params.now)
                     .bind(params.now)
-                    .execute(&mut *connection)
+                    .execute(&mut *transaction)
                     .await?;
                     return Ok(CronRunClaimResult::QueueBusy);
                 }
@@ -252,7 +252,7 @@ impl ICronRepository for SqliteCronRepository {
             .bind(params.now)
             .bind(params.now)
             .bind(params.now)
-            .execute(&mut *connection)
+            .execute(&mut *transaction)
             .await?;
 
             Ok(CronRunClaimResult::Claimed)
@@ -261,11 +261,11 @@ impl ICronRepository for SqliteCronRepository {
 
         match result {
             Ok(result) => {
-                sqlx::query("COMMIT").execute(&mut *connection).await?;
+                transaction.commit().await?;
                 Ok(result)
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }

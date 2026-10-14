@@ -38,6 +38,14 @@ pub mod team;
 mod user;
 pub mod user_order;
 
+use sqlx::{Sqlite, SqlitePool, Transaction};
+
+use crate::error::DbError;
+
+async fn begin_immediate(pool: &SqlitePool) -> Result<Transaction<'static, Sqlite>, DbError> {
+    Ok(pool.begin_with("BEGIN IMMEDIATE").await?)
+}
+
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;
 pub use assistant::{
