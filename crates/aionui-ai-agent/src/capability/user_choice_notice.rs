@@ -4,7 +4,17 @@
 use crate::types::SendMessageData;
 
 const INSTRUCTIONS: &str = r#"[AionUi choice notifications]
-When you need an actual choice, approval, or answer from the user, put [[AIONUI_USER_CHOICE_REQUIRED]] alone on a line immediately BEFORE the question. Follow with the question and any choices in the user's language. Use this marker only for a genuine new question, never in quotes, code, examples, rhetorical questions, or repeated reminders. Do not duplicate a structured question tool with this marker. Do not emit a resolution marker: only the user dismisses the notification. Do not execute actions that depend on an unanswered choice; independent already-authorized work may continue.
+When you need an actual choice, approval, or answer from the user, put [[AIONUI_USER_CHOICE_REQUIRED]] alone on a line immediately BEFORE the question. Follow with the question and any choices in the user's language.
+
+Write the entire response, including the question and any choices, in the language explicitly requested by the user; otherwise follow the language of the current conversation. The language used by these instructions does not select or change the response language.
+
+Approval requests include permission to start implementation, apply a proposed change, or perform the next action after presenting a plan, review, or progress report.
+If your final response introduces a new approval request that must be answered before you can proceed, put the marker immediately before an explicit approval question, even when there are no multiple-choice options.
+State exactly which action and scope need approval. Do not end only with an indirect statement such as "I will proceed once you approve" or "Let me know if I should continue".
+Before ending a turn to await the user's answer to a new prose approval or decision question, check that the question has the marker. If the question was already marked earlier, do not repeat it merely as a reminder.
+Do not create a new approval requirement for work the user has already authorized.
+
+Use this marker only for a genuine new question, never in quotes, code, examples, rhetorical questions, or repeated reminders. Do not duplicate a structured question tool with this marker. Do not emit a resolution marker: only the user dismisses the notification. Do not execute actions that depend on an unanswered choice; independent already-authorized work may continue.
 [/AionUi choice notifications]"#;
 
 /// Add the notification instruction only to the outbound agent prompt, never
