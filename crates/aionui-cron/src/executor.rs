@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use aionui_ai_agent::AgentRegistry;
 use aionui_ai_agent::task_manager::IWorkerTaskManager;
-use aionui_api_types::{AssistantConversationRequest, CreateConversationRequest};
+use aionui_api_types::{
+    AssistantConversationOverridesRequest, AssistantConversationRequest, CreateConversationRequest,
+};
 use aionui_common::{
     AgentType, ProviderWithModel, WorkspacePathValidationError, now_ms, validate_workspace_path_availability,
 };
@@ -1176,10 +1178,30 @@ fn build_assistant_request(job: &CronJob) -> Option<AssistantConversationRequest
                 .map(ToOwned::to_owned)
         })?;
 
+    let model = config
+        .model_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let thought_level = config
+        .config_options
+        .as_ref()
+        .and_then(|options| options.get("reasoning_effort"))
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    let conversation_overrides =
+        (model.is_some() || thought_level.is_some()).then_some(AssistantConversationOverridesRequest {
+            model,
+            thought_level,
+            ..Default::default()
+        });
+
     Some(AssistantConversationRequest {
         id: assistant_id,
         locale: None,
-        conversation_overrides: None,
+        conversation_overrides,
     })
 }
 
@@ -1931,12 +1953,52 @@ mod tests {
         let config = job.agent_config.as_mut().expect("sample job should carry config");
         config.assistant_id = None;
         config.custom_agent_id = Some("custom-assistant".into());
+        config.model_id = None;
 
         let assistant = build_assistant_request(&job).expect("legacy custom assistant should map to request");
 
         assert_eq!(assistant.id, "custom-assistant");
         assert!(assistant.locale.is_none());
         assert!(assistant.conversation_overrides.is_none());
+    }
+
+    #[test]
+    fn build_assistant_request_preserves_scheduled_model_and_reasoning_effort() {
+        for execution_mode in [ExecutionMode::Existing, ExecutionMode::NewConversation] {
+            let mut job = sample_job();
+            job.execution_mode = execution_mode;
+            let config = job.agent_config.as_mut().unwrap();
+            config.assistant_id = Some("bare:codex".into());
+            config.model_id = Some("gpt-6-astra".into());
+            config.config_options = Some(std::collections::HashMap::from([(
+                "reasoning_effort".into(),
+                "xhigh".into(),
+            )]));
+
+            let assistant = build_assistant_request(&job).unwrap();
+            assert_eq!(assistant.id, "bare:codex");
+            assert_eq!(
+                assistant.conversation_overrides,
+                Some(AssistantConversationOverridesRequest {
+                    model: Some("gpt-6-astra".into()),
+                    thought_level: Some("xhigh".into()),
+                    ..Default::default()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn build_assistant_request_keeps_defaults_for_empty_selections() {
+        let mut job = sample_job();
+        let config = job.agent_config.as_mut().unwrap();
+        config.model_id = Some("  ".into());
+        config.config_options = Some(std::collections::HashMap::from([(
+            "reasoning_effort".into(),
+            "  ".into(),
+        )]));
+
+        assert!(build_assistant_request(&job).unwrap().conversation_overrides.is_none());
     }
 
     #[tokio::test]

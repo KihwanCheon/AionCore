@@ -639,6 +639,7 @@ impl IConversationRepository for StubConvRepo {
     }
 
     async fn create(&self, row: &aionui_db::models::ConversationRow) -> Result<(), aionui_db::DbError> {
+        self.seed_sqlite_row(row).await?;
         self.rows.lock().unwrap().insert(row.id.clone(), row.clone());
         Ok(())
     }
@@ -2611,6 +2612,55 @@ async fn existing_job_with_missing_conversation_is_rejected() {
     req.execution_mode = Some("existing".into());
     let err = svc.add_job("u1", req).await.unwrap_err();
     assert!(matches!(err, aionui_cron::error::CronError::Conversation(_)));
+}
+
+#[tokio::test]
+async fn new_and_replacement_conversations_use_saved_codex_model_and_effort() {
+    for execution_mode in ["new_conversation", "existing"] {
+        let (svc, repo, _, conv_repo) = setup_with_conv_repo().await;
+        let mut req = make_create_req("Codex scheduled configuration", every_60s());
+        req.execution_mode = Some("new_conversation".into());
+        req.conversation_id.clear();
+        let config = req.agent_config.as_mut().unwrap();
+        config.assistant_id = Some("bare:8e1acf31".into());
+        config.model_id = Some("gpt-6-astra".into());
+        config.config_options = Some(HashMap::from([("reasoning_effort".into(), "xhigh".into())]));
+        let job = svc.add_job("u1", req).await.unwrap();
+
+        if execution_mode == "existing" {
+            let mut previous = conv_repo.get("u1", "conv_1").await.unwrap().unwrap();
+            previous.id = "missing-previous-cron-conversation".into();
+            conv_repo.create(&previous).await.unwrap();
+            repo.update_for_user(
+                "u1",
+                &job.id,
+                &aionui_db::UpdateCronJobParams {
+                    execution_mode: Some("existing".into()),
+                    conversation_id: Some("missing-previous-cron-conversation".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            // Delete the owned anchor after binding, as happens when the user discards it.
+            SqliteConversationRepository::new(conv_repo.sqlite_pool.clone())
+                .delete("u1", &previous.id)
+                .await
+                .unwrap();
+            conv_repo.rows.lock().unwrap().remove(&previous.id);
+        }
+
+        // The stub task manager never starts a CLI; preparation still persists the snapshot.
+        let response = svc.run_now("u1", &job.id).await.unwrap();
+        let snapshot = conv_repo
+            .get_assistant_snapshot("u1", &response.conversation_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.assistant_id, "bare:8e1acf31");
+        assert_eq!(snapshot.resolved_model_id.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(snapshot.resolved_thought_level_value.as_deref(), Some("xhigh"));
+    }
 }
 
 #[tokio::test]
