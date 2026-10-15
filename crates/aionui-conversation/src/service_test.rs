@@ -499,25 +499,6 @@ impl IConversationRepository for MockRepo {
         Ok(true)
     }
 
-    async fn resolve_choice_notices(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        updated_at: i64,
-    ) -> Result<u64, aionui_db::DbError> {
-        let mut rows = self.choice_notices.lock().unwrap();
-        let mut changed = 0;
-        for row in rows
-            .iter_mut()
-            .filter(|row| row.user_id == user_id && row.conversation_id == conversation_id && row.status == "pending")
-        {
-            row.status = "resolved".into();
-            row.updated_at = updated_at;
-            changed += 1;
-        }
-        Ok(changed)
-    }
-
     async fn list_messages_page(
         &self,
         _user_id: &str,
@@ -6433,7 +6414,7 @@ async fn send_message_broadcasts_user_created_event() {
 }
 
 #[tokio::test]
-async fn choice_notice_snapshot_is_broadcast_and_resolved_by_a_visible_user_message() {
+async fn choice_notice_survives_a_visible_user_message_until_explicit_dismissal() {
     let (svc, broadcaster, _repo, _task_mgr) = make_service();
     let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
@@ -6461,10 +6442,76 @@ async fn choice_notice_snapshot_is_broadcast_and_resolved_by_a_visible_user_mess
     svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr)
         .await
         .unwrap();
+    let after_send = svc.list_choice_notices("user_1").await.unwrap();
+    assert_eq!(after_send.len(), 1);
+    assert_eq!(after_send[0].key, pending[0].key);
+    let events = broadcaster.take_events();
+    assert!(events.iter().any(|event| event.name == "message.userCreated"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "conversation.choiceNoticesChanged")
+    );
+
+    svc.dismiss_choice_notice(
+        "user_1",
+        DismissChoiceNoticeRequest {
+            conversation_id: conv.id,
+            message_id: pending[0].message_id.clone(),
+            marker_index: pending[0].marker_index,
+            preview: pending[0].preview.clone(),
+            created_at: pending[0].created_at,
+        },
+    )
+    .await
+    .unwrap();
     assert!(svc.list_choice_notices("user_1").await.unwrap().is_empty());
     assert!(broadcaster.take_events().iter().any(|event| {
-        event.name == "conversation.choiceNoticesChanged" && event.data["items"].as_array().unwrap().is_empty()
+        event.name == "conversation.choiceNoticesChanged"
+            && event.data["user_id"] == "user_1"
+            && event.data["items"].as_array().unwrap().is_empty()
     }));
+}
+
+#[tokio::test]
+async fn midturn_user_message_preserves_choice_notices() {
+    let (svc, broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let pending = svc
+        .register_choice_notice(
+            "user_1",
+            RegisterChoiceNoticeRequest {
+                conversation_id: conv.id.clone(),
+                message_id: "assistant-message".into(),
+                marker_index: 0,
+                preview: "Restart now?".into(),
+                created_at: 1,
+            },
+        )
+        .await
+        .unwrap();
+    let _claim = svc.runtime_state().try_claim_turn(&conv.id, "turn_active").unwrap();
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+    let task_mgr: Arc<dyn IWorkerTaskManager> = task_mgr;
+    broadcaster.take_events();
+
+    let response = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr)
+        .await
+        .unwrap();
+    assert!(response.delivered_midturn);
+    let after_send = svc.list_choice_notices("user_1").await.unwrap();
+    assert_eq!(after_send.len(), 1);
+    assert_eq!(after_send[0].key, pending[0].key);
+    let events = broadcaster.take_events();
+    assert!(events.iter().any(|event| event.name == "message.userCreated"));
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.name == "conversation.choiceNoticesChanged")
+    );
 }
 
 #[tokio::test]

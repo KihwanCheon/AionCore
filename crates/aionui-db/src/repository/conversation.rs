@@ -145,15 +145,6 @@ pub trait IConversationRepository: Send + Sync {
         Ok(false)
     }
 
-    async fn resolve_choice_notices(
-        &self,
-        _user_id: &str,
-        _conversation_id: &str,
-        _updated_at: TimestampMs,
-    ) -> Result<u64, DbError> {
-        Ok(0)
-    }
-
     // ── Message operations ──────────────────────────────────────────
 
     /// Returns cursor-paginated messages for a conversation in ascending display order.

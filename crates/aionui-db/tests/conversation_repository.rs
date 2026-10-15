@@ -1560,7 +1560,7 @@ async fn choice_notices_are_user_scoped_and_keep_only_the_newest_identical_quest
 }
 
 #[tokio::test]
-async fn dismissed_and_answered_choice_notices_do_not_reappear() {
+async fn choice_notices_registered_after_a_user_message_remain_until_explicitly_dismissed() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("choice-lifecycle");
     repo.create(&conv).await.unwrap();
@@ -1575,25 +1575,34 @@ async fn dismissed_and_answered_choice_notices_do_not_reappear() {
     repo.insert_message(USER_ID, &answer).await.unwrap();
     let delayed = make_choice_notice(USER_ID, &conv.id, "message-b", "Deploy now?", 300);
     repo.upsert_choice_notice(&delayed).await.unwrap();
+    repo.upsert_choice_notice(&dismissed).await.unwrap();
+    let pending = repo.list_choice_notices(USER_ID).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].key, delayed.key);
+
+    assert!(repo.dismiss_choice_notice(&delayed).await.unwrap());
+    repo.upsert_choice_notice(&delayed).await.unwrap();
     assert!(repo.list_choice_notices(USER_ID).await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn resolving_a_conversation_keeps_other_conversations_pending() {
+async fn dismissing_a_choice_notice_keeps_siblings_and_other_conversations_pending() {
     let (repo, _db) = setup().await;
     let first = make_conversation("choice-first");
     let second = make_conversation("choice-second");
     repo.create(&first).await.unwrap();
     repo.create(&second).await.unwrap();
-    repo.upsert_choice_notice(&make_choice_notice(USER_ID, &first.id, "message-a", "First?", 100))
-        .await
-        .unwrap();
+    let dismissed = make_choice_notice(USER_ID, &first.id, "message-a", "First?", 100);
+    repo.upsert_choice_notice(&dismissed).await.unwrap();
+    let sibling = make_choice_notice(USER_ID, &first.id, "message-c", "Another question?", 150);
+    repo.upsert_choice_notice(&sibling).await.unwrap();
     repo.upsert_choice_notice(&make_choice_notice(USER_ID, &second.id, "message-b", "Second?", 200))
         .await
         .unwrap();
 
-    assert_eq!(repo.resolve_choice_notices(USER_ID, &first.id, 300).await.unwrap(), 1);
+    assert!(repo.dismiss_choice_notice(&dismissed).await.unwrap());
     let pending = repo.list_choice_notices(USER_ID).await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].conversation_id, second.id);
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[0].key, sibling.key);
+    assert_eq!(pending[1].conversation_id, second.id);
 }

@@ -3628,34 +3628,6 @@ impl ConversationService {
         Ok(())
     }
 
-    async fn resolve_choice_notices_after_user_message(&self, user_id: &str, conversation_id: &str) {
-        match self
-            .conversation_repo
-            .resolve_choice_notices(user_id, conversation_id, now_ms())
-            .await
-        {
-            Ok(0) => {}
-            Ok(resolved_count) => match self.list_choice_notices(user_id).await {
-                Ok(items) => {
-                    info!(
-                        user_id,
-                        conversation_id,
-                        resolved_count,
-                        pending_count = items.len(),
-                        "Choice notifications resolved by user message"
-                    );
-                    if let Err(error) = self.broadcast_choice_notices(user_id, &items) {
-                        warn!(conversation_id, error = %error, "Failed to broadcast resolved choice notifications");
-                    }
-                }
-                Err(error) => {
-                    warn!(conversation_id, error = %error, "Failed to reload resolved choice notifications")
-                }
-            },
-            Err(error) => warn!(conversation_id, error = %error, "Failed to resolve choice notifications"),
-        }
-    }
-
     /// Search messages across all conversations for the user.
     pub async fn search_messages(
         &self,
@@ -3999,10 +3971,6 @@ impl ConversationService {
                     "created_at": user_msg.created_at,
                 }),
             ));
-            if !hidden {
-                self.resolve_choice_notices_after_user_message(user_id, conversation_id)
-                    .await;
-            }
         }
         let data = aionui_ai_agent::types::SendMessageData {
             content: resolved.content.clone(),
@@ -4282,10 +4250,6 @@ impl ConversationService {
                     "created_at": user_msg.created_at,
                 }),
             ));
-            if !req.hidden {
-                self.resolve_choice_notices_after_user_message(user_id, conversation_id)
-                    .await;
-            }
         }
 
         // Build task options from conversation row

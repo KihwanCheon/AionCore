@@ -798,39 +798,6 @@ impl IConversationRepository for SqliteConversationRepository {
             return Ok(());
         }
 
-        let answered_after_notice: bool = sqlx::query_scalar(
-            "SELECT EXISTS( \
-                SELECT 1 FROM messages m \
-                WHERE m.conversation_id = ? AND m.position = 'right' AND m.hidden = 0 AND m.created_at >= ? \
-             )",
-        )
-        .bind(&notice.conversation_id)
-        .bind(notice.created_at)
-        .fetch_one(&mut *tx)
-        .await?;
-        if answered_after_notice {
-            sqlx::query(
-                "INSERT INTO choice_notifications \
-                    (user_id, key, conversation_id, message_id, marker_index, preview, status, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, 'resolved', ?, ?) \
-                 ON CONFLICT(user_id, key) DO UPDATE SET \
-                    status = 'resolved', updated_at = excluded.updated_at \
-                 WHERE choice_notifications.status = 'pending'",
-            )
-            .bind(&notice.user_id)
-            .bind(&notice.key)
-            .bind(&notice.conversation_id)
-            .bind(&notice.message_id)
-            .bind(notice.marker_index)
-            .bind(&notice.preview)
-            .bind(notice.created_at)
-            .bind(notice.updated_at)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
-            return Ok(());
-        }
-
         let newest_duplicate = sqlx::query_as::<_, ChoiceNoticeRow>(
             "SELECT * FROM choice_notifications \
              WHERE user_id = ? AND conversation_id = ? AND status = 'pending' AND preview = ? \
@@ -933,24 +900,6 @@ impl IConversationRepository for SqliteConversationRepository {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
-    }
-
-    async fn resolve_choice_notices(
-        &self,
-        user_id: &str,
-        conversation_id: &str,
-        updated_at: i64,
-    ) -> Result<u64, DbError> {
-        let result = sqlx::query(
-            "UPDATE choice_notifications SET status = 'resolved', updated_at = ? \
-             WHERE user_id = ? AND conversation_id = ? AND status = 'pending'",
-        )
-        .bind(updated_at)
-        .bind(user_id)
-        .bind(conversation_id)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
     }
 
     // ── Message operations ──────────────────────────────────────────
