@@ -156,7 +156,7 @@ impl StreamPersistenceAdapter {
         debug!(conversation_id = %self.conversation_id, turn_id, status = "finished", "Turn completed");
     }
 
-    fn allows_write(&self, kind: RuntimeWriteKind) -> bool {
+    pub(crate) fn allows_write(&self, kind: RuntimeWriteKind) -> bool {
         self.persistence
             .as_ref()
             .is_none_or(|persistence| persistence.allows(&self.conversation_id, kind))

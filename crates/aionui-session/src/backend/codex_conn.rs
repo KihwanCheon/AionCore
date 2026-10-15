@@ -3162,11 +3162,22 @@ fn command_execution_display_name(item: &Value) -> String {
     label
 }
 
+mod user_questions;
+
 /// A1 CORE: match the item's `type` STRING with a fallthrough. The closed codex
 /// ThreadItem enum is NEVER constructed in our code, so an unknown future `type`
 /// becomes `AdapterSpecific` instead of a deserialization panic.
 fn map_item(params: &Value, completed: bool) -> Vec<SessionEvent> {
     let item = params.get("item").unwrap_or(&Value::Null);
+    if let Some(question) = user_questions::from_item(item) {
+        // The started/completed snapshots repeat the same prefilled question.
+        // Keep it separate from prose and emit only the completed snapshot.
+        return if completed {
+            vec![SessionEvent::UserQuestion(question)]
+        } else {
+            Vec::new()
+        };
+    }
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or("");
     let id = item.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     let mut out: Vec<SessionEvent> = Vec::new();
@@ -5768,6 +5779,48 @@ mod tests {
     }
 
     // ===== notification → SessionEvent mapping (transport-agnostic fold) =====
+
+    #[tokio::test]
+    async fn async_question_notification_transport_preserves_question_and_following_text() {
+        // Real 0.162.1 thread/read item with schema-derived notification envelopes.
+        let item: Value = serde_json::from_str(include_str!("codex_conn/user_question_01621.json")).unwrap();
+        let frames: Vec<String> = ["item/started", "item/completed"]
+            .into_iter()
+            .map(|method| {
+                json!({"jsonrpc":"2.0", "method":method, "params":{"threadId":"th1", "turnId":"t1", "item":item}})
+                    .to_string()
+            })
+            .collect();
+        let events = drive_codex(&[
+            frames[0].as_str(), frames[1].as_str(),
+            r#"{"jsonrpc":"2.0","method":"item/agentMessage/delta","params":{"threadId":"th1","turnId":"t1","itemId":"next","delta":"continued"}}"#,
+            r#"{"jsonrpc":"2.0","method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"completed"}}}"#,
+        ]).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, SessionEvent::UserQuestion(_)))
+                .count(),
+            1
+        );
+        let prose: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::MessageDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            prose,
+            ["continued"],
+            "the structured question must not also become prose"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, SessionEvent::Ask { .. } | SessionEvent::Permission { .. }))
+        );
+    }
 
     #[test]
     fn prefilled_agent_message_emits_text_streamed_one_does_not() {

@@ -183,6 +183,17 @@ pub fn step(state: &SessionState, event: SessionEvent) -> (SessionState, Vec<Tra
             (to, Vec::new())
         }
 
+        SessionEvent::UserQuestion(data) => {
+            let mut to = state.clone();
+            if !data.questions.is_empty()
+                && let SessionState::Running { saw_substantive_output, .. } = &mut to
+            {
+                *saw_substantive_output = true;
+            }
+            // Async questions leave the agent free to continue independent work.
+            (to, Vec::new())
+        }
+
         // thinking/reasoning is NOT substantive (C5/I5): no state change.
         SessionEvent::ThoughtDelta { .. } => (state.clone(), Vec::new()),
 

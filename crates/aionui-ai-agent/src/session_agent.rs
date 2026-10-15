@@ -2624,6 +2624,7 @@ fn session_event_name(e: &SessionEvent) -> &'static str {
     match e {
         SessionEvent::TurnStarted { .. } => "TurnStarted",
         SessionEvent::MessageDelta { .. } => "MessageDelta",
+        SessionEvent::UserQuestion(..) => "UserQuestion",
         SessionEvent::ThoughtDelta { .. } => "ThoughtDelta",
         SessionEvent::ToolCall { .. } => "ToolCall",
         SessionEvent::ToolResult { .. } => "ToolResult",
@@ -2951,6 +2952,7 @@ fn spawn_event_pump(
                     // BackendBound/Provisioning) deliberately do NOT re-arm: they
                     // routinely trail a settled turn.
                     SessionEvent::MessageDelta { .. }
+                    | SessionEvent::UserQuestion(..)
                     | SessionEvent::ThoughtDelta { .. }
                     | SessionEvent::ToolCall { .. }
                     | SessionEvent::ToolResult { .. }
@@ -4295,6 +4297,7 @@ fn event_is_user_visible_output(event: &AgentStreamEvent) -> bool {
     matches!(
         event,
         AgentStreamEvent::Text(_)
+            | AgentStreamEvent::UserQuestion(_)
             | AgentStreamEvent::Thinking(_)
             | AgentStreamEvent::ToolCall(_)
             | AgentStreamEvent::AcpToolCall(_)
@@ -4369,6 +4372,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
         SessionEvent::MessageDelta { text, .. } => {
             vec![AgentStreamEvent::Text(TextEventData { content: text })]
         }
+        SessionEvent::UserQuestion(data) => vec![AgentStreamEvent::UserQuestion(data)],
         SessionEvent::ThoughtDelta { text, .. } => {
             vec![AgentStreamEvent::Thinking(ThinkingEventData {
                 content: text,
@@ -6259,6 +6263,23 @@ mod translate_tests {
             FinishEventData::default()
         )));
         assert!(!event_is_user_visible_output(&AgentStreamEvent::SegmentBreak));
+    }
+
+    #[test]
+    fn async_question_translation_keeps_identity_and_counts_as_visible_output() {
+        let data = aionui_session::UserQuestionData {
+            item_id: "async-call".into(),
+            questions: vec![aionui_session::UserInputQuestion {
+                title: "승인하시겠습니까?".into(),
+                options: None,
+            }],
+        };
+        let events = translate_event(SessionEvent::UserQuestion(data.clone()), "conv", false);
+        let [AgentStreamEvent::UserQuestion(translated)] = events.as_slice() else {
+            panic!("question metadata lost")
+        };
+        assert_eq!(translated, &data);
+        assert!(event_is_user_visible_output(&events[0]));
     }
 }
 

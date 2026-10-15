@@ -6,6 +6,7 @@ pub mod translate;
 use serde::{Deserialize, Serialize};
 
 pub use aionui_api_types::AgentStreamErrorData as ErrorEventData;
+pub use aionui_session::{UserInputQuestion, UserQuestionData};
 
 pub use permission::{
     AcpPermissionEventData, AcpPermissionOptionData, AcpPermissionOptionKind, AcpPermissionRequestData,
@@ -29,6 +30,9 @@ pub enum AgentStreamEvent {
     Start(StartEventData),
     #[serde(rename = "content")]
     Text(TextEventData),
+    /// Internal-only non-blocking questions. The relay persists separate text
+    /// anchors and manual-dismissal notifications; no confirmation RPC is opened.
+    UserQuestion(UserQuestionData),
     Tips(TipsEventData),
     ToolCall(ToolCallEventData),
     AcpToolCall(AcpToolCallEventData),

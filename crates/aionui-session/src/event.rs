@@ -71,6 +71,9 @@ pub enum SessionEvent {
     // ---- data events (adapter framing+parse output) ----
     /// assistant content block type="text". Non-empty = substantive (C5).
     MessageDelta { item_id: String, text: String },
+    /// Non-blocking structured questions, answered by a later user message.
+    /// Unlike `Ask`, this does not open a control request or pause the turn.
+    UserQuestion(UserQuestionData),
     /// assistant content block type="thinking". NOT substantive (C5).
     ThoughtDelta { item_id: String, text: String },
     /// assistant content block type="tool_use". tool_use_id demux key is
@@ -619,6 +622,20 @@ pub enum SessionEvent {
     },
 }
 
+/// A backend-authored question delivered independently of the current reply.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UserInputQuestion {
+    pub title: String,
+    pub options: Option<Vec<String>>,
+}
+
+/// Stable backend identity plus the questions in their original order.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UserQuestionData {
+    pub item_id: String,
+    pub questions: Vec<UserInputQuestion>,
+}
+
 // ==========================================================================
 // ADDITIVE supporting types (007 §C2 / §9). All serde-derived for Tier-1/2
 // persistence. None is read by `step()` except where wired through
@@ -955,6 +972,7 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | BackendSuspended => EventClass::OrchestrationLowered,
         // backend-produced (self-describing; PERSISTED — tier decided separately, §7.2)
         MessageDelta { .. }
+        | UserQuestion(..)
         | ThoughtDelta { .. }
         | ToolCall { .. }
         | ToolResult { .. }
@@ -1025,6 +1043,7 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             // cancelled), re-derivable from the next turn's own frames — not history.
             MessageLifecycle { .. } => PersistTier::Ephemeral,
             ToolCall { .. }
+            | UserQuestion(..)
             | ToolResult { .. }
             | UsageDelta { .. }
             | Provisioning { .. }

@@ -207,6 +207,19 @@ impl ChannelMessageService {
     pub fn process_stream_event(event: &AgentStreamEvent) -> Option<StreamAction> {
         match event {
             AgentStreamEvent::Text(data) => Some(StreamAction::AppendText(data.content.clone())),
+            AgentStreamEvent::UserQuestion(data) => {
+                // Async questions used to arrive as ordinary text. Preserve that
+                // channel transcript while the app relay owns their notices.
+                let text = data.questions.iter().map(|question| {
+                    let mut text = question.title.clone();
+                    for option in question.options.iter().flatten() {
+                        text.push_str("\n- ");
+                        text.push_str(option);
+                    }
+                    text
+                }).collect::<Vec<_>>().join("\n\n");
+                (!text.is_empty()).then_some(StreamAction::AppendText(text))
+            }
             AgentStreamEvent::Finish(_) => Some(StreamAction::Finish),
             AgentStreamEvent::Error(data) => Some(StreamAction::Error(data.message.clone())),
             AgentStreamEvent::Thinking(data) => Some(StreamAction::Thinking(data.content.clone())),
@@ -524,6 +537,38 @@ mod tests {
             Some(StreamAction::AppendText(text)) => assert_eq!(text, "Hello"),
             _ => panic!("Expected AppendText"),
         }
+    }
+
+    #[test]
+    fn async_question_preserves_titles_and_options_in_channel_text() {
+        use aionui_ai_agent::protocol::events::{UserInputQuestion, UserQuestionData};
+        let event = AgentStreamEvent::UserQuestion(UserQuestionData {
+            item_id: "question".into(),
+            questions: vec![
+                UserInputQuestion {
+                    title: "포함 범위를 선택해주세요.".into(),
+                    options: Some(vec!["일반 대화".into(), "Teams 포함".into()]),
+                },
+                UserInputQuestion {
+                    title: "보관 기간을 입력해주세요.".into(),
+                    options: None,
+                },
+            ],
+        });
+        match ChannelMessageService::process_stream_event(&event) {
+            Some(StreamAction::AppendText(text)) => assert_eq!(
+                text,
+                "포함 범위를 선택해주세요.\n- 일반 대화\n- Teams 포함\n\n보관 기간을 입력해주세요."
+            ),
+            other => panic!("expected question text: {other:?}"),
+        }
+        assert!(
+            ChannelMessageService::process_stream_event(&AgentStreamEvent::UserQuestion(UserQuestionData {
+                item_id: "empty".into(),
+                questions: vec![],
+            }))
+            .is_none()
+        );
     }
 
     #[test]

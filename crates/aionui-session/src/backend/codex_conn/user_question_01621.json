@@ -1,0 +1,14 @@
+{
+  "type": "agentMessage",
+  "id": "call_de4ec6f871324bdd9b681f9cd90d0892",
+  "text": "자동 완전 삭제 대상에 보관된 Teams와 그 하위 대화도 포함할까요?\n- 보관된 일반 대화만 포함 (권장)\n- 보관된 대화와 Teams 모두 포함",
+  "phase": "final_answer",
+  "memoryCitation": null,
+  "delivery": "async",
+  "questions": [
+    {
+      "title": "자동 완전 삭제 대상에 보관된 Teams와 그 하위 대화도 포함할까요?",
+      "options": ["보관된 일반 대화만 포함 (권장)", "보관된 대화와 Teams 모두 포함"]
+    }
+  ]
+}

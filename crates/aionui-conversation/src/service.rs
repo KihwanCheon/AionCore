@@ -93,7 +93,7 @@ fn normalize_choice_notice_preview(preview: &str) -> String {
     preview.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn choice_notice_row_to_response(row: ChoiceNoticeRow) -> Result<ChoiceNoticeResponse, ConversationError> {
+pub(crate) fn choice_notice_row_to_response(row: ChoiceNoticeRow) -> Result<ChoiceNoticeResponse, ConversationError> {
     let marker_index = u32::try_from(row.marker_index)
         .map_err(|_| ConversationError::internal("Choice notification marker index is out of range"))?;
     Ok(ChoiceNoticeResponse {

@@ -21,6 +21,8 @@ use tokio::sync::broadcast::error::TryRecvError;
 use tokio::sync::{broadcast, oneshot};
 use tracing::{debug, info, warn};
 
+mod user_questions;
+
 /// Number of text chunks to accumulate before flushing to the database.
 const FLUSH_INTERVAL: u32 = 20;
 
@@ -448,6 +450,14 @@ impl StreamRelay {
                             segment.buffer.push_str(&data.content);
                             self.forward_to_websocket_with_msg_id(&segment.id, &event);
                         }
+                        AgentStreamEvent::UserQuestion(data) => {
+                            self.complete_active_thinking(&mut active_thinking).await;
+                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish").await;
+                            // Keep these anchors outside terminal prose rewrites and later replies.
+                            let persisted = self.persist_user_questions(data).await;
+                            attempt.saw_visible_output |= persisted;
+                            attempt.persisted_assistant_output |= persisted;
+                        }
                         AgentStreamEvent::Text(data) => {
                             self.complete_active_thinking(&mut active_thinking).await;
                             if !first_visible_output_logged && !data.content.is_empty() {
@@ -791,6 +801,7 @@ impl StreamRelay {
         match event {
             AgentStreamEvent::Start(_) => "Start",
             AgentStreamEvent::Text(_) => "Text",
+            AgentStreamEvent::UserQuestion(_) => "UserQuestion",
             AgentStreamEvent::Tips(_) => "Tips",
             AgentStreamEvent::Thinking(_) => "Thinking",
             AgentStreamEvent::ToolCall(_) => "ToolCall",

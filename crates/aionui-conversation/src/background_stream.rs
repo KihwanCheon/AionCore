@@ -83,6 +83,7 @@ impl BackgroundStreamWatcher {
         matches!(
             ev,
             AgentStreamEvent::Text(_)
+                | AgentStreamEvent::UserQuestion(_)
                 | AgentStreamEvent::Thinking(_)
                 | AgentStreamEvent::ToolCall(_)
                 | AgentStreamEvent::AcpToolCall(_)
@@ -484,6 +485,7 @@ impl BackgroundStreamWatcher {
 fn frame_kind(ev: &AgentStreamEvent) -> &'static str {
     match ev {
         AgentStreamEvent::Text(_) => "text",
+        AgentStreamEvent::UserQuestion(_) => "user_question",
         AgentStreamEvent::Thinking(_) => "thinking",
         AgentStreamEvent::ToolCall(_) => "tool_call",
         AgentStreamEvent::AcpToolCall(_) => "acp_tool_call",
