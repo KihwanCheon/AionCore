@@ -24,6 +24,9 @@ serde_json.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
+iana-time-zone.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

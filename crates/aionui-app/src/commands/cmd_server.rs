@@ -323,6 +323,10 @@ pub(crate) async fn run_server(
     // watch channel propagates graceful-shutdown so the scanner exits on
     // SIGINT/SIGTERM.
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let archive_retention_handle = router_runtime
+        .sidebar_service
+        .clone()
+        .start_archive_retention(shutdown_rx.clone());
     let (shutdown_error_tx, shutdown_error_rx) = tokio::sync::oneshot::channel::<BootstrapError>();
     let idle_cleanup_coordinator: Arc<dyn aionui_ai_agent::IdleCleanupCoordinator> =
         Arc::new(TeamIdleCleanupCoordinator::new(
@@ -478,6 +482,10 @@ pub(crate) async fn run_server(
             "idle scanner join timed out; abandoning scanner task",
         ),
     }
+
+    // Stop retention before closing its DB pool, including an in-progress batch.
+    archive_retention_handle.abort();
+    let _ = archive_retention_handle.await;
 
     // `sqlx::Pool::close()` waits for all checked-out connections to be
     // returned, which is unbounded if a detached task still holds one.

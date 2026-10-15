@@ -1,3 +1,4 @@
+pub mod archive_retention_repository;
 pub mod external_dispatch_repository;
 pub(crate) mod migration_compat;
 

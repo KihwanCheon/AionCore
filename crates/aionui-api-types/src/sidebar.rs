@@ -183,3 +183,23 @@ pub struct SidebarTeamItem {
     /// Active member conversation ids, `created_at` ascending.
     pub member_conversation_ids: Vec<String>,
 }
+/// Daily permanent-deletion policy for independent archived conversations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveRetentionSettings {
+    pub enabled: bool,
+    pub retention_days: i64,
+    /// Local wall-clock time, exactly HH:mm.
+    pub run_at: String,
+    /// IANA timezone shared by every device editing this policy.
+    pub timezone: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArchiveRetentionResponse {
+    pub settings: ArchiveRetentionSettings,
+    pub next_run_at: Option<i64>,
+    pub last_run_at: Option<i64>,
+    pub last_deleted: i64,
+    pub last_failed: i64,
+}

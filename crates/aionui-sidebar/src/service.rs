@@ -32,6 +32,9 @@ use aionui_db::{
 use aionui_project::canonical;
 
 use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
+use aionui_db::fork_extensions::archive_retention_repository::IArchiveRetentionRepository;
+
+mod archive_retention;
 use crate::types::{
     Cursor, DEFAULT_ITEMS_LIMIT, DEFAULT_LIMIT, ScopeToken, SidebarError, canonical_to_dir_key, validate_limit,
 };
@@ -45,6 +48,8 @@ const KIND_STANDARD: &str = "standard";
 
 /// The sidebar read/assembly service.
 pub struct SidebarService {
+    archive_retention: OnceLock<Arc<dyn IArchiveRetentionRepository>>,
+    archive_mutation: tokio::sync::Mutex<()>,
     sidebar: Arc<dyn ISidebarStore>,
     user_order: Arc<dyn IUserOrderStore>,
     /// Backend-managed data dir (conversation workspace root). Used both to
@@ -64,6 +69,8 @@ pub struct SidebarService {
 impl SidebarService {
     pub fn new(sidebar: Arc<dyn ISidebarStore>, user_order: Arc<dyn IUserOrderStore>, work_dir: PathBuf) -> Self {
         Self {
+            archive_retention: OnceLock::new(),
+            archive_mutation: tokio::sync::Mutex::new(()),
             sidebar,
             user_order,
             work_dir,
@@ -112,6 +119,7 @@ impl SidebarService {
     /// pinned row (D6 — an archived item is never pinned). A missing / foreign id
     /// is `ScopeGone` (404); the flip is otherwise idempotent for the slice.
     pub async fn archive_conversation(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        let _guard = self.archive_mutation.lock().await;
         if !self
             .sidebar
             .set_conversation_archived(user_id, id, Some(now_ms()))
@@ -129,6 +137,7 @@ impl SidebarService {
     /// `ScopeGone`. No re-pin: the pinned row was dropped at archive time (D6) and
     /// is not restored.
     pub async fn unarchive_conversation(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        let _guard = self.archive_mutation.lock().await;
         if !self.sidebar.set_conversation_archived(user_id, id, None).await? {
             return Err(SidebarError::ScopeGone);
         }
@@ -139,6 +148,7 @@ impl SidebarService {
     /// conversations so the folded unit stays in one slice; the team's own pinned
     /// row is then dropped (D6). Missing team → `ScopeGone`.
     pub async fn archive_team(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        let _guard = self.archive_mutation.lock().await;
         if !self.sidebar.set_team_archived(user_id, id, Some(now_ms())).await? {
             return Err(SidebarError::ScopeGone);
         }
@@ -151,6 +161,7 @@ impl SidebarService {
     /// Unarchive a team (the store cascades its members back). Missing team →
     /// `ScopeGone`.
     pub async fn unarchive_team(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        let _guard = self.archive_mutation.lock().await;
         if !self.sidebar.set_team_archived(user_id, id, None).await? {
             return Err(SidebarError::ScopeGone);
         }
@@ -423,6 +434,7 @@ impl SidebarService {
     /// Best-effort per unit; a vanished / failed unit is logged and skipped.
     /// Non-standard / foreign project → `ScopeGone`.
     pub async fn archive_project(&self, user_id: &str, project_id: &str) -> Result<(), SidebarError> {
+        let _guard = self.archive_mutation.lock().await;
         let (teams, convs) = self
             .collect_project_units(user_id, project_id, ArchiveScope::Active)
             .await?;
@@ -474,6 +486,7 @@ impl SidebarService {
     /// members). Best-effort per unit. Non-standard / foreign project →
     /// `ScopeGone`. No re-pin (D6 dropped the pinned rows at archive time).
     pub async fn unarchive_project(&self, user_id: &str, project_id: &str) -> Result<(), SidebarError> {
+        let _guard = self.archive_mutation.lock().await;
         let (teams, convs) = self
             .collect_project_units(user_id, project_id, ArchiveScope::Archived)
             .await?;

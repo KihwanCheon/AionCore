@@ -1,2 +1,3 @@
 *.sh text eol=lf
 *.ps1 text eol=crlf
+crates/aionui-db/migrations/2026101501_archive_retention.sql text eol=lf

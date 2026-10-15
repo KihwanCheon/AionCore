@@ -602,6 +602,11 @@ pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
         services.user_order_store.clone(),
         services.work_dir.join("conversations"),
     );
+    service.set_archive_retention_repository(Arc::new(
+        aionui_db::fork_extensions::archive_retention_repository::SqliteArchiveRetentionRepository::new(
+            services.database.pool().clone(),
+        ),
+    ));
     SidebarRouterState {
         service: Arc::new(service),
     }

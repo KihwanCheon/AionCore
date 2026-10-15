@@ -58,6 +58,7 @@ use super::state::{ModuleStates, RouterBuildError, build_module_states, build_ws
 use super::trace::with_access_log;
 
 pub struct RouterRuntime {
+    pub sidebar_service: Arc<aionui_sidebar::SidebarService>,
     pub client_pref_service: ClientPrefService,
     pub team_service: Arc<TeamSessionService>,
 }
@@ -123,6 +124,7 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let (states, channel_components) = build_module_states(services).await?;
     let client_pref_service = states.system.client_pref_service.clone();
     let team_service = states.team.service.clone();
+    let sidebar_service = states.sidebar.service.clone();
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: module states built");
 
     // Start channel orchestrator (message loop)
@@ -187,6 +189,7 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     Ok((
         router,
         RouterRuntime {
+            sidebar_service,
             client_pref_service,
             team_service,
         },

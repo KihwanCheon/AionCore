@@ -20,7 +20,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, ArchiveDeleteResult, MoveOrderRequest, RemoveProjectResult, SidebarItemsResponse, SidebarResponse,
+    ApiResponse, ArchiveDeleteResult, ArchiveRetentionResponse, ArchiveRetentionSettings, MoveOrderRequest,
+    RemoveProjectResult, SidebarItemsResponse, SidebarResponse,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -63,11 +64,42 @@ pub fn sidebar_routes(state: SidebarRouterState) -> Router {
         .route("/api/sidebar/team/{id}/unarchive", post(unarchive_team))
         .route("/api/sidebar/archived", delete(delete_archived))
         .route(
+            "/api/sidebar/archive-retention",
+            get(get_archive_retention).put(save_archive_retention),
+        )
+        .route(
             "/api/sidebar/archived/conversation/{id}",
             delete(delete_archived_conversation),
         )
         .route("/api/sidebar/archived/team/{id}", delete(delete_archived_team))
         .with_state(state)
+}
+
+async fn get_archive_retention(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<ArchiveRetentionResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .get_archive_retention(&user.id)
+            .await
+            .map_err(to_api_error)?,
+    )))
+}
+
+async fn save_archive_retention(
+    State(state): State<SidebarRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(settings): Json<ArchiveRetentionSettings>,
+) -> Result<Json<ApiResponse<ArchiveRetentionResponse>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        state
+            .service
+            .save_archive_retention(&user.id, settings)
+            .await
+            .map_err(to_api_error)?,
+    )))
 }
 
 /// `GET /api/sidebar?limit=5&win=project:P1:10&win=chats:20` — first screen.
