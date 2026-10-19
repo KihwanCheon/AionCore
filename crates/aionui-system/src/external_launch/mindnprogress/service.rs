@@ -9,6 +9,7 @@ use reqwest::{Client, Method, Url};
 use serde::{Deserialize, de::DeserializeOwned};
 
 use super::error::MindNProgressNavigationError;
+use super::runner_relay::prefer_local_or_runner;
 
 const MINDNPROGRESS_MCP_NAME: &str = "MindNProgress";
 const DEFAULT_MNP_API_URL: &str = "http://127.0.0.1:4176";
@@ -28,9 +29,14 @@ struct StdioTransportConfig {
     env: HashMap<String, String>,
 }
 
-struct MindNProgressIntegration {
-    api_base_url: Url,
-    token_file: PathBuf,
+pub(super) struct MindNProgressIntegration {
+    pub(super) api_base_url: Url,
+    pub(super) token: IntegrationToken,
+}
+
+pub(super) enum IntegrationToken {
+    File(PathBuf),
+    Runner(String),
 }
 
 impl MindNProgressIntegration {
@@ -145,11 +151,19 @@ impl MindNProgressNavigationService {
         }
         let transport: StdioTransportConfig =
             serde_json::from_str(&server.transport_config).map_err(|_| MindNProgressNavigationError::NotConfigured)?;
-        resolve_integration_from_transport(&transport)
+        let local = resolve_integration_from_transport(&transport)?;
+        // Explicit backend configuration keeps its existing destination.
+        if backend_setting(&transport, "MNP_API_URL").is_some() {
+            return Ok(local);
+        }
+        let descriptor_file = backend_setting(&transport, "MNP_RUNNER_MCP_RELAY_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("aionui-mindnprogress-mcp-relay.json"));
+        Ok(prefer_local_or_runner(&self.client, local, &descriptor_file).await)
     }
 }
 
-async fn relay_request<T: DeserializeOwned>(
+pub(super) async fn relay_request<T: DeserializeOwned>(
     client: &Client,
     integration: &MindNProgressIntegration,
     method: Method,
@@ -157,9 +171,12 @@ async fn relay_request<T: DeserializeOwned>(
     select: bool,
     selection_device_address: Option<IpAddr>,
 ) -> Result<T, MindNProgressNavigationError> {
-    let token = tokio::fs::read_to_string(&integration.token_file)
-        .await
-        .map_err(|_| MindNProgressNavigationError::NotConfigured)?;
+    let token = match &integration.token {
+        IntegrationToken::File(path) => tokio::fs::read_to_string(path)
+            .await
+            .map_err(|_| MindNProgressNavigationError::NotConfigured)?,
+        IntegrationToken::Runner(token) => token.clone(),
+    };
     let token = token.trim();
     if token.is_empty() {
         return Err(MindNProgressNavigationError::NotConfigured);
@@ -168,6 +185,9 @@ async fn relay_request<T: DeserializeOwned>(
     let mut request = client
         .request(method, integration.endpoint(conversation_id, select)?)
         .bearer_auth(token);
+    if matches!(integration.token, IntegrationToken::Runner(_)) {
+        request = request.header("x-mnp-ai-conversation-id", conversation_id);
+    }
     if let Some(address) = selection_device_address {
         request = request.header("x-mnp-selection-device-address", address.to_string());
     }
@@ -250,7 +270,7 @@ fn resolve_integration_from_transport(
     let api_base_url = normalize_loopback_api_url(configured_url)?;
     Ok(MindNProgressIntegration {
         api_base_url,
-        token_file,
+        token: IntegrationToken::File(token_file),
     })
 }
 
@@ -263,7 +283,7 @@ fn backend_setting(transport: &StdioTransportConfig, name: &str) -> Option<Strin
         .filter(|value| !value.trim().is_empty())
 }
 
-fn normalize_loopback_api_url(value: &str) -> Result<Url, MindNProgressNavigationError> {
+pub(super) fn normalize_loopback_api_url(value: &str) -> Result<Url, MindNProgressNavigationError> {
     let configured = Url::parse(value).map_err(|_| MindNProgressNavigationError::NotConfigured)?;
     let loopback_host = matches!(configured.host_str(), Some("127.0.0.1" | "localhost" | "::1"));
     if configured.scheme() != "http"
@@ -327,7 +347,7 @@ mod tests {
 
         let resolved = resolve_integration_from_transport(&transport).unwrap();
         assert_eq!(resolved.api_base_url.as_str(), "http://127.0.0.1:4321/");
-        assert_eq!(resolved.token_file, token_file);
+        assert!(matches!(resolved.token, IntegrationToken::File(path) if path == token_file));
     }
 
     #[test]
@@ -352,6 +372,78 @@ mod tests {
         let json = serde_json::to_string(&ApiResponse::ok(response)).unwrap();
         assert!(!json.contains("integration-token"));
         assert!(!json.contains("Authorization"));
+    }
+
+    #[tokio::test]
+    async fn stored_mcp_configuration_discovers_the_runner_without_a_local_integration_token() {
+        use aionui_db::{
+            CreateMcpServerParams, SqliteConversationRepository, SqliteMcpServerRepository, init_database_memory,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct DescriptorGuard(PathBuf);
+        impl Drop for DescriptorGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(&self.0);
+            }
+        }
+
+        let proxy = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/health"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&proxy)
+            .await;
+        // Route the discovery probe into the fixture, independent of a real MnP
+        // already running on the developer machine's default loopback port.
+        let client = Client::builder()
+            .proxy(reqwest::Proxy::all(proxy.uri()).unwrap())
+            .build()
+            .unwrap();
+        let unique = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let descriptor_file =
+            DescriptorGuard(std::env::temp_dir().join(format!("aioncore-mnp-discovery-{unique}.json")));
+        let relay_token = format!("mnprl_{}", "a".repeat(43));
+        std::fs::write(
+            &descriptor_file.0,
+            serde_json::json!({
+                "schemaVersion": 1, "baseUrl": "http://127.0.0.1:54321",
+                "token": relay_token, "instanceId": "runner-instance-123456", "pid": std::process::id(),
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let db = init_database_memory().await.unwrap();
+        let mcp_repo = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
+        let transport = serde_json::json!({
+            "args": [std::env::temp_dir().join("missing-mnp-project/mcp/server.mjs")],
+            "env": {"MNP_API_URL": "", "MNP_RUNNER_MCP_RELAY_FILE": descriptor_file.0},
+        })
+        .to_string();
+        mcp_repo
+            .create(CreateMcpServerParams {
+                user_id: "system_default_user",
+                name: MINDNPROGRESS_MCP_NAME,
+                description: None,
+                enabled: true,
+                transport_type: "stdio",
+                transport_config: &transport,
+                tools: None,
+                original_json: None,
+                builtin: false,
+            })
+            .await
+            .unwrap();
+        let service = MindNProgressNavigationService::new(
+            Arc::new(SqliteConversationRepository::new(db.pool().clone())),
+            mcp_repo,
+            client,
+        );
+        let resolved = service.resolve_integration("system_default_user").await.unwrap();
+        assert_eq!(resolved.api_base_url.as_str(), "http://127.0.0.1:54321/");
+        assert!(matches!(resolved.token, IntegrationToken::Runner(token) if token == relay_token));
     }
 
     #[tokio::test]
@@ -411,7 +503,7 @@ mod tests {
         std::fs::write(&token_file, "secret-token\n").unwrap();
         let integration = MindNProgressIntegration {
             api_base_url: Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap(),
-            token_file: token_file.clone(),
+            token: IntegrationToken::File(token_file.clone()),
         };
         let client = Client::builder().no_proxy().build().unwrap();
 

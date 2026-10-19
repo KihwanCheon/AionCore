@@ -138,6 +138,18 @@ fn map_navigation_error(error: MindNProgressNavigationError) -> ApiError {
 
 fn map_upstream_error(status: u16, code: Option<&str>, message: String) -> ApiError {
     match (status, code) {
+        (403, Some("MNP_RUNNER_MCP_PATH_DENIED")) => {
+            ApiError::coded(StatusCode::FORBIDDEN, "MNP_RUNNER_MCP_PATH_DENIED", message, None)
+        }
+        (403, Some("MNP_RUNNER_MCP_CONVERSATION_DENIED")) => ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "MNP_RUNNER_MCP_CONVERSATION_DENIED",
+            message,
+            None,
+        ),
+        (403, Some("MNP_RUNNER_MCP_ACCOUNT_MISMATCH")) => {
+            ApiError::coded(StatusCode::FORBIDDEN, "MNP_RUNNER_MCP_ACCOUNT_MISMATCH", message, None)
+        }
         (400, Some("MNP_AI_CONVERSATION_ID_INVALID")) => {
             ApiError::coded(StatusCode::BAD_REQUEST, "MNP_AI_CONVERSATION_ID_INVALID", message, None)
         }
@@ -186,6 +198,9 @@ mod tests {
     #[test]
     fn upstream_selection_errors_keep_the_mnp_code_and_message() {
         let cases = [
+            (403, "MNP_RUNNER_MCP_PATH_DENIED"),
+            (403, "MNP_RUNNER_MCP_CONVERSATION_DENIED"),
+            (403, "MNP_RUNNER_MCP_ACCOUNT_MISMATCH"),
             (400, "MNP_SELECTION_ACCOUNT_REQUIRED"),
             (400, "MNP_SELECTION_DEVICE_ADDRESS_INVALID"),
             (400, "MNP_SELECTION_DEVICE_REQUIRED"),

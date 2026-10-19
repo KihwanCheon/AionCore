@@ -26,6 +26,7 @@ pub(crate) fn build_fork_integration_services(
 ) -> anyhow::Result<ForkIntegrationServices> {
     let http_client = reqwest::Client::builder()
         .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(5))
         .build()?;
 
