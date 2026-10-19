@@ -1472,7 +1472,11 @@ impl IAgentTask for SessionAgentTask {
         // waiting for the last Arc to drop.
         if matches!(
             reason,
-            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
+            Some(
+                AgentKillReason::UserCancelTimeout
+                    | AgentKillReason::RuntimeRestart
+                    | AgentKillReason::ConversationDeleted
+            )
         ) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
@@ -1490,7 +1494,7 @@ impl IAgentTask for SessionAgentTask {
             });
             return Ok(());
         }
-        // Non-`UserCancelTimeout` (idle cleanup): unchanged Drop-driven teardown. The
+        // Idle cleanup: unchanged Drop-driven teardown. The
         // `SessionBackend` trait exposes no close/shutdown command; the sole reaper is
         // `Drop for ClaudeSessionBackend` / `CodexSessionBackend`, which aborts the
         // reader and `kill_on_drop`s the child once the last `Arc` is released. An idle
@@ -1503,11 +1507,12 @@ impl IAgentTask for SessionAgentTask {
 impl SessionAgentTask {
     /// Awaitable force-kill (aligns with `AcpAgentManager::kill_and_wait`): the
     /// awaitable teardown entry the `UserCancel` watchdog uses. For a
-    /// `UserCancelTimeout` kill it emits the clean `Finish` synchronously FIRST
+    /// force-kill it emits the clean `Finish` synchronously FIRST
     /// (so the gate recovers before the returned future is even polled), then
-    /// returns a future that awaits the backend's real process teardown. Any
-    /// other reason keeps the pre-existing Drop-driven semantics (nothing to
-    /// await). The strict order — clean converge, THEN terminate — is what keeps
+    /// returns a future that awaits the backend's real process teardown. Deletion
+    /// must also await termination before native history cleanup, even while an
+    /// orchestrator still holds the task. Other reasons keep Drop-driven semantics
+    /// (nothing to await). The strict order — clean converge, THEN terminate — is what keeps
     /// the kill from surfacing as a crash (see `SuspendController::terminate`).
     pub fn kill_and_wait(
         &self,
@@ -1515,7 +1520,11 @@ impl SessionAgentTask {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         if matches!(
             reason,
-            Some(AgentKillReason::UserCancelTimeout | AgentKillReason::RuntimeRestart)
+            Some(
+                AgentKillReason::UserCancelTimeout
+                    | AgentKillReason::RuntimeRestart
+                    | AgentKillReason::ConversationDeleted
+            )
         ) {
             tracing::info!(
                 conversation_id = %self.conversation_id,
@@ -2219,7 +2228,9 @@ pub async fn build_session_instance(
     Ok(Some(crate::agent_task::AgentInstance::Session(task)))
 }
 
-fn resolve_session_cli_program(
+/// Resolve the same command override or PATH program for provisioning and
+/// native history maintenance, so both operate on the user's selected CLI.
+pub fn resolve_session_cli_program(
     backend_label: &str,
     metadata: &aionui_api_types::AgentMetadata,
 ) -> Option<std::path::PathBuf> {
@@ -10721,6 +10732,30 @@ mod force_kill_tests {
         );
         assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
         assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn conversation_delete_terminates_before_returning_with_external_arc() {
+        let (task, counter) = build_task_with_counter();
+        let mut rx = IAgentTask::subscribe(task.as_ref());
+        start_turn(task.as_ref()).await;
+        let orchestrator_hold = Arc::clone(&task);
+
+        let inst = AgentInstance::Session(Arc::clone(&task));
+        inst.kill_and_wait(Some(AgentKillReason::ConversationDeleted)).await;
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "native history cleanup must not begin before backend termination"
+        );
+        assert_eq!(IAgentTask::status(task.as_ref()), Some(ConversationStatus::Finished));
+        assert!(matches!(
+            next_terminal(&mut rx).await,
+            Some(AgentStreamEvent::Finish(_))
+        ));
+        assert!(Arc::strong_count(&task) >= 2);
+        drop(orchestrator_hold);
     }
 
     /// T6: isolation — non-`UserCancelTimeout` reasons keep the original

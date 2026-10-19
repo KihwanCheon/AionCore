@@ -122,6 +122,7 @@ impl AppServices {
     pub fn with_worker_task_manager(mut self, wtm: Arc<dyn IWorkerTaskManager>) -> Self {
         self.worker_task_manager = wtm;
         self.conversation_service = build_conversation_service(ConversationServiceDeps {
+            agent_registry: self.agent_registry.clone(),
             database: &self.database,
             work_dir: self.work_dir.clone(),
             event_bus: self.event_bus.clone(),
@@ -393,6 +394,7 @@ impl AppServices {
         let task_manager_delete_hook: Arc<dyn OnConversationDelete> = task_manager_concrete;
         let conversation_runtime_state = Arc::new(ConversationRuntimeStateService::default());
         let conversation_service = build_conversation_service(ConversationServiceDeps {
+            agent_registry: agent_registry.clone(),
             database: &database,
             work_dir: work_dir.clone(),
             event_bus: event_bus.clone(),
@@ -469,6 +471,7 @@ impl AppServices {
 }
 
 struct ConversationServiceDeps<'a> {
+    agent_registry: Arc<AgentRegistry>,
     database: &'a Database,
     work_dir: PathBuf,
     event_bus: Arc<BroadcastEventBus>,
@@ -502,6 +505,9 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAgentMetadataRepository::new(deps.database.pool().clone())),
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
+    .with_native_history_cleaner(Arc::new(crate::native_history::CodexHistoryCleaner::new(
+        deps.agent_registry,
+    )))
     .with_runtime_state(deps.conversation_runtime_state)
     .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
     .with_runtime_token_service(deps.runtime_token_service);

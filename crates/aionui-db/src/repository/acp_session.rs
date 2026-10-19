@@ -67,6 +67,13 @@ impl SaveRuntimeStateParams<'_> {
 
 #[async_trait::async_trait]
 pub trait IAcpSessionRepository: Send + Sync {
+    /// Native resume/fork anchors of every other persisted conversation,
+    /// including archived conversations and other users. Failure must retain
+    /// history rather than assuming that nothing references it.
+    async fn protected_native_session_ids(&self, _excluding_conversation: &str) -> Result<Vec<String>, DbError> {
+        Err(DbError::Init("Native session protection is unavailable".into()))
+    }
+
     /// Fetch the full row only when the owning conversation belongs to `user_id`.
     async fn get_for_user(&self, user_id: &str, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError>;
 
@@ -97,8 +104,8 @@ pub trait IAcpSessionRepository: Send + Sync {
     async fn clear_session_id_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError>;
 
     /// Delete the row when the owning conversation belongs to `user_id`.
-    /// Called by the conversation delete hook — no DB foreign key, so this
-    /// must be invoked explicitly.
+    /// Requires the parent to exist. Conversation deletion removes both rows
+    /// atomically in the conversation repository instead of using this method.
     async fn delete_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError>;
 
     /// Decode and return the `session_config.runtime` sub-object.

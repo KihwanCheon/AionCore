@@ -416,16 +416,29 @@ impl IConversationRepository for SqliteConversationRepository {
     }
 
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        // The session repository's owner check needs the parent row. Remove
+        // both in one transaction so a failed delete keeps the resume anchor.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM acp_session WHERE conversation_id = ? \
+             AND EXISTS (SELECT 1 FROM conversations WHERE id = ? AND user_id = ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
         let result = sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
             .bind(user_id)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
         }
 
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2048,6 +2061,64 @@ mod tests {
         let (repo, _db) = setup().await;
         let err = repo.delete("user_1", "no_id").await.unwrap_err();
         assert!(matches!(err, DbError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn delete_atomically_removes_native_session_anchor() {
+        let (repo, db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        let sessions = crate::SqliteAcpSessionRepository::new(db.pool().clone());
+        use crate::IAcpSessionRepository;
+        sessions
+            .create(&crate::CreateAcpSessionParams {
+                user_id: SYSTEM_USER_ID,
+                conversation_id: &conv.id,
+                agent_source: "builtin",
+                agent_id: "8e1acf31",
+            })
+            .await
+            .unwrap();
+        let denied = repo.delete("different-user", &conv.id).await.unwrap_err();
+        assert!(matches!(denied, DbError::NotFound(_)));
+        assert!(sessions.get_for_user(SYSTEM_USER_ID, &conv.id).await.unwrap().is_some());
+        repo.delete(SYSTEM_USER_ID, &conv.id).await.unwrap();
+        let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM acp_session WHERE conversation_id = ?")
+            .bind(&conv.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "check the physical row, not an owner-filtered read after the parent disappeared"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_parent_delete_rolls_back_native_session_removal() {
+        let (repo, db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        let sessions = crate::SqliteAcpSessionRepository::new(db.pool().clone());
+        use crate::IAcpSessionRepository;
+        sessions
+            .create(&crate::CreateAcpSessionParams {
+                user_id: SYSTEM_USER_ID,
+                conversation_id: &conv.id,
+                agent_source: "builtin",
+                agent_id: "8e1acf31",
+            })
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TRIGGER refuse_delete BEFORE DELETE ON conversations BEGIN SELECT RAISE(ABORT, 'fixture'); END",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(repo.delete(SYSTEM_USER_ID, &conv.id).await.is_err());
+        assert!(repo.get(SYSTEM_USER_ID, &conv.id).await.unwrap().is_some());
+        assert!(sessions.get_for_user(SYSTEM_USER_ID, &conv.id).await.unwrap().is_some());
     }
 
     // ── Pagination tests ────────────────────────────────────────────

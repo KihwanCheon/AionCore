@@ -189,6 +189,32 @@ fn merge_runtime_state(raw: &str, params: &SaveRuntimeStateParams<'_>) -> Result
 
 #[async_trait::async_trait]
 impl IAcpSessionRepository for SqliteAcpSessionRepository {
+    async fn protected_native_session_ids(&self, excluding_conversation: &str) -> Result<Vec<String>, DbError> {
+        let rows: Vec<(Option<String>, String)> = sqlx::query_as(
+            "SELECT s.session_id, c.extra FROM conversations c \
+             LEFT JOIN acp_session s ON s.conversation_id = c.id WHERE c.id != ?",
+        )
+        .bind(excluding_conversation)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut ids = std::collections::HashSet::new();
+        for (session_id, extra) in rows {
+            if let Some(id) = session_id.filter(|id| !id.trim().is_empty()) {
+                ids.insert(id);
+            }
+            let extra: Value = serde_json::from_str(&extra)
+                .map_err(|_| DbError::Init("Invalid conversation fork metadata; keeping native history".into()))?;
+            if let Some(fork) = extra.get("fork") {
+                for key in ["parent_session_id", "parentSessionId"] {
+                    if let Some(id) = fork.get(key).and_then(Value::as_str).filter(|id| !id.trim().is_empty()) {
+                        ids.insert(id.to_owned());
+                    }
+                }
+            }
+        }
+        Ok(ids.into_iter().collect())
+    }
+
     async fn get_for_user(&self, user_id: &str, conversation_id: &str) -> Result<Option<AcpSessionRow>, DbError> {
         let row = sqlx::query_as::<_, AcpSessionRow>(
             "SELECT a.* FROM acp_session a \
@@ -746,5 +772,41 @@ mod tests {
             .await
             .unwrap();
         assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn protects_other_users_archived_and_lazy_fork_anchors_but_not_orphans() {
+        let (repo, _db) = setup().await;
+        repo.create(&create_params("conv-1")).await.unwrap();
+        repo.update_session_id_unscoped("conv-1", "deleting").await.unwrap();
+        insert_conversation(&repo, "other-user", "retained").await;
+        repo.create(&CreateAcpSessionParams {
+            user_id: "other-user",
+            conversation_id: "retained",
+            agent_source: "builtin",
+            agent_id: "8e1acf31",
+        })
+        .await
+        .unwrap();
+        repo.update_session_id_unscoped("retained", "keep-native")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET archived_at = 1, extra = ? WHERE id = 'retained'")
+            .bind(r#"{"fork":{"parent_session_id":"keep-parent"}}"#)
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO acp_session (conversation_id,agent_source,agent_id,session_id) VALUES ('orphan','builtin','8e1acf31','orphan-native')")
+            .execute(&repo.pool).await.unwrap();
+        let ids: std::collections::HashSet<_> = repo
+            .protected_native_session_ids("conv-1")
+            .await
+            .unwrap()
+            .into_iter()
+            .collect();
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from(["keep-native".to_owned(), "keep-parent".to_owned()])
+        );
     }
 }

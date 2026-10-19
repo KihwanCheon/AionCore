@@ -1,5 +1,6 @@
 mod external_report;
 mod mcp_reload;
+pub mod native_history;
 mod turn_observation;
 mod workspace_rebind;
 
@@ -356,6 +357,8 @@ pub struct ConversationService {
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl.
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
+    native_history_cleaner: Option<Arc<dyn native_history::NativeHistoryCleaner>>,
+    native_history_gate: Arc<tokio::sync::Mutex<()>>,
     /// Hooks invoked when `cancel()` actually cancelled a turn, so upper-layer
     /// services can drop work aimed at this conversation. See
     /// `OnConversationTurnCancelled` for why only some branches fire.
@@ -494,6 +497,8 @@ impl ConversationService {
             skill_resolver,
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
+            native_history_cleaner: None,
+            native_history_gate: Arc::new(tokio::sync::Mutex::new(())),
             turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
@@ -2690,6 +2695,7 @@ impl ConversationService {
     /// Broadcasts `conversation.listChanged(deleted)`.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
+        let _history_guard = self.native_history_gate.lock().await;
         // Get existing to retrieve source for broadcast and verify ownership
         let existing = self
             .conversation_repo
@@ -2731,6 +2737,26 @@ impl ConversationService {
 
         let had_active_turn = self.runtime_state.mark_deleting(id);
 
+        // Stop even a first turn whose native session has not been bound yet.
+        // The cleanup helper must read the final anchor after provisioning stops.
+        if tokio::time::timeout(
+            Duration::from_secs(30),
+            self.task_manager
+                .kill_and_wait(id, Some(AgentKillReason::ConversationDeleted)),
+        )
+        .await
+        .is_err()
+        {
+            self.runtime_state.clear_deleting(id);
+            return Err(ConversationError::internal(
+                "Timed out stopping the conversation before history cleanup",
+            ));
+        }
+        if let Err(err) = self.delete_native_history(user_id, &existing).await {
+            self.runtime_state.clear_deleting(id);
+            return Err(err);
+        }
+
         // Snapshot the hook list under the read lock, then drop the guard
         // before awaiting — `RwLockReadGuard` is not `Send`, so holding it
         // across `.await` would make this future non-`Send`.
@@ -2752,15 +2778,7 @@ impl ConversationService {
         if !had_active_turn {
             self.runtime_state.clear_deleting(id);
         }
-        // No FK / CASCADE on `acp_session`: clean it up here so non-ACP
-        // conversations that used to be ACP (shouldn't happen but is
-        // cheap to cover) still drop their orphaned session row.
-        if let Err(err) = self.acp_session_repo.delete_for_user(user_id, id).await {
-            warn!(
-                error = %ErrorChain(&err),
-                "Failed to delete acp_session row on conversation delete"
-            );
-        }
+        // The repository atomically removes the session anchor with its parent.
         if let Some(workspace) = auto_workspace_to_delete {
             let workspace_removed = match tokio::fs::remove_dir_all(&workspace).await {
                 Ok(()) => {
@@ -2832,6 +2850,7 @@ impl ConversationService {
         id: &str,
         req: ForkConversationRequest,
     ) -> Result<ConversationResponse, ConversationError> {
+        let _history_guard = self.native_history_gate.lock().await;
         let parent = self
             .conversation_repo
             .get(user_id, id)

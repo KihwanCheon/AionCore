@@ -7,6 +7,7 @@
 
 mod config;
 mod fork_integrations;
+mod native_history;
 mod router;
 mod services;
 
