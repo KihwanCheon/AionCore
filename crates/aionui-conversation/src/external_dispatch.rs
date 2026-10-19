@@ -874,6 +874,10 @@ mod tests {
                 is_processing: false,
                 pending_confirmations: 0,
                 turn_id: None,
+                can_stop: false,
+                cancel_turn_id: None,
+                runtime_instance_id: String::new(),
+                runtime_revision: 0,
                 supports_midturn_delivery: false,
             },
         };

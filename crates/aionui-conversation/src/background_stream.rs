@@ -40,11 +40,6 @@ use crate::service::ConversationService;
 use crate::stream_persistence::StreamPersistenceAdapter;
 use crate::stream_relay::StreamRelay;
 
-/// An orphan turn with NO frame for this long is presumed abandoned (a stray
-/// content frame with no terminal); the feeder closes and the relay finalizes
-/// with what it has, so the watcher can never be wedged forever.
-const ORPHAN_TURN_IDLE_MS: u64 = 180_000;
-
 /// How long a `MessageLifecycle{Started}` echo stays armed as "the next
 /// agent-started turn serves a user message" before it is presumed lost.
 ///
@@ -67,6 +62,7 @@ pub(crate) struct BackgroundStreamWatcher {
     pub broadcaster: Arc<dyn EventBroadcaster>,
     pub persistence: RuntimePersistenceCoordinator,
     pub runtime_state: Arc<ConversationRuntimeStateService>,
+    pub runtime_snapshot: Arc<dyn Fn() -> aionui_api_types::ConversationRuntimeSummary + Send + Sync>,
     /// True for non-Session (ACP manager) instances: consume ONLY agent
     /// session titles and leave every other frame to the existing ACP
     /// delivery paths (orphan turns / card refreshes are Session semantics).
@@ -404,6 +400,30 @@ impl BackgroundStreamWatcher {
             .is_some()
             .then(|| self.runtime_state.claim_for_agent_turn(&self.conversation_id, &turn_id))
             .flatten();
+        let notify: Arc<dyn Fn() + Send + Sync> = {
+            let snapshot = self.runtime_snapshot.clone();
+            let broadcaster = self.broadcaster.clone();
+            let conversation_id = self.conversation_id.clone();
+            let user_id = self.user_id.clone();
+            Arc::new(move || {
+                broadcaster.broadcast(aionui_api_types::WebSocketMessage::new(
+                    "conversation.runtimeChanged",
+                    json!({ "user_id": user_id, "conversation_id": conversation_id, "runtime": snapshot() }),
+                ));
+            })
+        };
+        let background = if _agent_claim.is_none() {
+            let Some(background) =
+                self.runtime_state
+                    .register_background_turn(&self.conversation_id, &turn_id, notify.clone())
+            else {
+                return;
+            };
+            Some(background)
+        } else {
+            notify();
+            None
+        };
         info!(
             conversation_id = %self.conversation_id,
             turn_id = %turn_id,
@@ -421,18 +441,21 @@ impl BackgroundStreamWatcher {
             self.broadcaster.clone(),
         )
         .with_runtime_state(Arc::clone(&self.runtime_state))
+        .with_turn_completion(false)
         .with_persistence(self.persistence.clone());
 
         let (feed_tx, feed_rx) = broadcast::channel::<AgentStreamEvent>(256);
         let mut relay_task = tokio::spawn(relay.consume(feed_rx));
         let _ = feed_tx.send(first);
 
-        let idle = std::time::Duration::from_millis(ORPHAN_TURN_IDLE_MS);
+        // Silence is not a terminal: long tools / reasoning can produce no
+        // frames for minutes. Keep the stop target until Finish, source closure,
+        // takeover, or watcher teardown. The cancel watchdog bounds a stuck stop.
         let outcome = loop {
             tokio::select! {
                 joined = &mut relay_task => break joined,
-                next = tokio::time::timeout(idle, rx.recv()) => match next {
-                    Ok(Ok(ev)) => {
+                next = rx.recv() => match next {
+                    Ok(ev) => {
                         // A user turn starting mid-orphan-turn takes the stream
                         // over; stop feeding so two relays never double-process.
                         // Our OWN claim (an agent turn serving a user message)
@@ -452,13 +475,12 @@ impl BackgroundStreamWatcher {
                         }
                         let _ = feed_tx.send(ev);
                     }
-                    // Source closed (instance torn down) or idle too long: close
-                    // the feed so the relay finalizes with what it has.
-                    Ok(Err(broadcast::error::RecvError::Closed)) | Err(_) => {
+                    // Source closed (instance torn down): finalize partial output.
+                    Err(broadcast::error::RecvError::Closed) => {
                         drop(feed_tx);
                         break relay_task.await;
                     }
-                    Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!(lagged = n, "background stream: orphan turn feed lagged");
                         continue;
                     }
@@ -479,6 +501,22 @@ impl BackgroundStreamWatcher {
                 "background stream: orphan relay task failed"
             ),
         }
+        // Release cancellation before publishing completion, including takeover
+        // by a newer user turn. The snapshot must describe the surviving turn.
+        let claimed = _agent_claim.is_some();
+        drop(background);
+        drop(_agent_claim);
+        if claimed {
+            notify();
+        }
+        crate::runtime_completion::RuntimeCompletionPublisher::new(
+            self.user_id.clone(),
+            self.repo.clone(),
+            self.broadcaster.clone(),
+            self.persistence.clone(),
+        )
+        .publish(&self.conversation_id, &turn_id, Some((self.runtime_snapshot)()))
+        .await;
     }
 }
 
@@ -533,6 +571,113 @@ mod tests {
         rig_with_opts(false, PENDING_STARTED_TTL).await
     }
 
+    async fn next_runtime(
+        ws: &mut broadcast::Receiver<aionui_api_types::WebSocketMessage<serde_json::Value>>,
+    ) -> serde_json::Value {
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let event = ws.recv().await.unwrap();
+                if event.name == "conversation.runtimeChanged" {
+                    return event.data["runtime"].clone();
+                }
+            }
+        })
+        .await
+        .expect("runtime change must reach the client")
+    }
+
+    #[tokio::test]
+    async fn quiet_continuation_keeps_its_stop_target_beyond_the_old_idle_timeout() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "working".into(),
+            }))
+            .unwrap();
+        let started = next_runtime(&mut ws).await;
+        // SQLite uses a real worker thread; pause only after fixture setup.
+        tokio::time::pause();
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        tokio::task::yield_now().await;
+        tokio::time::resume();
+        // Let any erroneously closed relay finish its real SQLite writes:
+        // checking immediately after advance could miss its delayed release.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), next_runtime(&mut ws))
+                .await
+                .is_err(),
+            "silence must not publish a completed runtime"
+        );
+        assert_eq!(
+            rig.runtime_state.cancel_turn_id_for("conv-1").as_deref(),
+            started["cancel_turn_id"].as_str()
+        );
+        assert!(rig.runtime_state.active_turn_id_for("conv-1").is_none());
+        rig._watcher.abort();
+    }
+
+    #[tokio::test]
+    async fn continuation_announces_stop_target_without_locking_input_and_releases_on_finish() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "continuation".into(),
+            }))
+            .unwrap();
+        let running = next_runtime(&mut ws).await;
+        assert_eq!(running["can_stop"], true);
+        assert_eq!(running["can_send_message"], true);
+        assert_eq!(running["turn_id"], serde_json::Value::Null);
+        assert!(running["cancel_turn_id"].as_str().is_some());
+        rig.tx
+            .send(AgentStreamEvent::Finish(FinishEventData::default()))
+            .unwrap();
+        let finished = next_runtime(&mut ws).await;
+        assert_eq!(finished["can_stop"], false);
+        assert!(finished["runtime_revision"].as_u64() > running["runtime_revision"].as_u64());
+    }
+
+    #[tokio::test]
+    async fn continuation_takeover_publishes_the_new_foreground_stop_target() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "background".into(),
+            }))
+            .unwrap();
+        let old = next_runtime(&mut ws).await;
+        let _claim = rig.runtime_state.try_claim_turn("conv-1", "foreground").unwrap();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "foreground".into(),
+            }))
+            .unwrap();
+        let current = next_runtime(&mut ws).await;
+        assert_eq!(current["cancel_turn_id"], "foreground");
+        assert_eq!(current["can_send_message"], false);
+        assert!(
+            !rig.runtime_state
+                .try_begin_cancel("conv-1", old["cancel_turn_id"].as_str().unwrap())
+        );
+    }
+
+    #[tokio::test]
+    async fn watcher_abort_releases_and_announces_its_stop_target() {
+        let rig = rig().await;
+        let mut ws = rig.bus.subscribe();
+        rig.tx
+            .send(AgentStreamEvent::Text(TextEventData {
+                content: "background".into(),
+            }))
+            .unwrap();
+        assert_eq!(next_runtime(&mut ws).await["can_stop"], true);
+        rig._watcher.abort();
+        assert_eq!(next_runtime(&mut ws).await["can_stop"], false);
+    }
+
     async fn rig_with(title_only: bool) -> Rig {
         rig_with_opts(title_only, PENDING_STARTED_TTL).await
     }
@@ -572,6 +717,10 @@ mod tests {
             broadcaster: bus.clone(),
             persistence: RuntimePersistenceCoordinator::new(Arc::clone(&runtime_state)),
             runtime_state: Arc::clone(&runtime_state),
+            runtime_snapshot: {
+                let state = runtime_state.clone();
+                Arc::new(move || state.summary_from_parts("conv-1", None, true, 0, true))
+            },
             title_only,
             pending_started_ttl,
         };

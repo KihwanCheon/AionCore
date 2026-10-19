@@ -7804,6 +7804,69 @@ async fn cancel_with_mismatched_turn_id_does_not_cancel_and_returns_current_runt
 }
 
 #[tokio::test]
+async fn cancel_background_execution_uses_its_target_without_a_foreground_claim() {
+    let (svc, _bus, _repo, _tasks) = make_service();
+    let tasks = Arc::new(MockTaskManager::new());
+    let tasks_dyn: Arc<dyn IWorkerTaskManager> = tasks.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(BlockingCancelAgent::new(&conv.id));
+    tasks.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let state = svc.runtime_state();
+    let background = state
+        .register_background_turn(&conv.id, "background", Arc::new(|| {}))
+        .unwrap();
+    let idle = svc.runtime_summary_for(&conv.id).await;
+    assert!(idle.can_send_message && idle.can_stop && idle.turn_id.is_none());
+    let stopped = svc.cancel("user_1", &conv.id, "background", &tasks_dyn).await.unwrap();
+    assert_eq!(agent.cancel_count.load(Ordering::SeqCst), 1);
+    assert_eq!(stopped.runtime.cancel_turn_id.as_deref(), Some("background"));
+    assert!(!stopped.runtime.can_send_message);
+    drop(background);
+    assert!(!svc.runtime_summary_for(&conv.id).await.can_stop);
+}
+
+#[tokio::test]
+async fn stale_background_cancel_does_not_interrupt_new_foreground_execution() {
+    let (svc, _bus, _repo, _tasks) = make_service();
+    let tasks = Arc::new(MockTaskManager::new());
+    let tasks_dyn: Arc<dyn IWorkerTaskManager> = tasks.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(BlockingCancelAgent::new(&conv.id));
+    tasks.insert_agent(&conv.id, AgentInstance::Mock(agent.clone()));
+    let state = svc.runtime_state();
+    let _background = state
+        .register_background_turn(&conv.id, "background", Arc::new(|| {}))
+        .unwrap();
+    let _foreground = state.try_claim_turn(&conv.id, "foreground").unwrap();
+    let response = svc.cancel("user_1", &conv.id, "background", &tasks_dyn).await.unwrap();
+    assert_eq!(agent.cancel_count.load(Ordering::SeqCst), 0);
+    assert_eq!(response.runtime.cancel_turn_id.as_deref(), Some("foreground"));
+    assert!(!state.is_cancelling(&conv.id));
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_timeout_also_terminates_unclaimed_background_execution() {
+    let (svc, _bus, _repo, _tasks) = make_service();
+    let tasks = Arc::new(MockTaskManager::new());
+    let tasks_dyn: Arc<dyn IWorkerTaskManager> = tasks.clone();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let agent = Arc::new(BlockingCancelAgent::new(&conv.id));
+    tasks.insert_agent(&conv.id, AgentInstance::Mock(agent));
+    let state = svc.runtime_state();
+    let _background = state
+        .register_background_turn(&conv.id, "background", Arc::new(|| {}))
+        .unwrap();
+    svc.cancel("user_1", &conv.id, "background", &tasks_dyn).await.unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(15) + Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        tasks.kill_records(),
+        vec![(conv.id.clone(), Some(AgentKillReason::UserCancelTimeout))]
+    );
+}
+
+#[tokio::test]
 async fn cancel_keeps_turn_claim_until_agent_terminal_event() {
     let (svc, _broadcaster, _repo, _task_mgr) = make_service();
     let task_mgr = Arc::new(MockTaskManager::new());

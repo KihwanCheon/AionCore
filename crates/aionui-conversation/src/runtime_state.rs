@@ -1,3 +1,7 @@
+mod background;
+#[cfg(test)]
+mod background_tests;
+
 use std::{
     collections::{HashMap, HashSet},
     sync::{Arc, Mutex, Weak},
@@ -10,15 +14,28 @@ use tracing::{info, warn};
 
 use crate::ConversationError;
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ConversationRuntimeStateService {
     state: Mutex<ConversationRuntimeState>,
     release_notify: Notify,
+    instance_id: String,
+}
+
+impl Default for ConversationRuntimeStateService {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ConversationRuntimeState::default()),
+            release_notify: Notify::new(),
+            instance_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 struct ConversationRuntimeState {
     active_turns: HashMap<String, String>,
+    background_turns: HashMap<String, String>,
+    revision: u64,
     deleting_conversations: HashSet<String>,
     cancelling_conversations: HashSet<String>,
     restarting_conversations: HashSet<String>,
@@ -105,6 +122,12 @@ impl ConversationRuntimeStateService {
             });
         }
 
+        if state.cancelling_conversations.contains(conversation_id) {
+            return Err(ConversationError::Busy {
+                reason: format!("conversation {conversation_id} is cancelling"),
+            });
+        }
+
         if let Some(active_turn_id) = state.active_turns.get(conversation_id).cloned() {
             // Once per active turn, not once per attempt: the cross-session
             // drainer retries a queued delivery every second and loses the claim
@@ -143,6 +166,7 @@ impl ConversationRuntimeStateService {
         state
             .active_turns
             .insert(conversation_id.to_owned(), turn_id.to_owned());
+        state.revision += 1;
 
         info!(conversation_id, turn_id, "conversation runtime turn claimed");
 
@@ -186,6 +210,7 @@ impl ConversationRuntimeStateService {
                 state
                     .active_turns
                     .keys()
+                    .chain(state.background_turns.keys())
                     .chain(state.cancelling_conversations.iter())
                     .cloned()
                     .collect::<HashSet<_>>()
@@ -209,6 +234,7 @@ impl ConversationRuntimeStateService {
         match self.state.lock() {
             Ok(mut state) => {
                 state.deleting_conversations.insert(conversation_id.to_owned());
+                state.revision += 1;
                 let active = state.active_turns.contains_key(conversation_id);
                 info!(conversation_id, active, "conversation marked deleting");
                 active
@@ -227,6 +253,7 @@ impl ConversationRuntimeStateService {
         match self.state.lock() {
             Ok(mut state) => {
                 state.deleting_conversations.remove(conversation_id);
+                state.revision += 1;
             }
             Err(_) => {
                 warn!(
@@ -248,6 +275,7 @@ impl ConversationRuntimeStateService {
         match self.state.lock() {
             Ok(mut state) => {
                 state.cancelling_conversations.insert(conversation_id.to_owned());
+                state.revision += 1;
                 info!(conversation_id, "conversation marked cancelling");
             }
             Err(_) => {
@@ -263,6 +291,7 @@ impl ConversationRuntimeStateService {
         match self.state.lock() {
             Ok(mut state) => {
                 state.cancelling_conversations.remove(conversation_id);
+                state.revision += 1;
             }
             Err(_) => {
                 warn!(
@@ -342,6 +371,7 @@ impl ConversationRuntimeStateService {
             });
         }
         info!(conversation_id, "conversation runtime marked restarting");
+        state.revision += 1;
         Ok(())
     }
 
@@ -384,6 +414,7 @@ impl ConversationRuntimeStateService {
         match self.state.lock() {
             Ok(mut state) => {
                 if state.restarting_conversations.remove(conversation_id) {
+                    state.revision += 1;
                     info!(conversation_id, "conversation runtime restart gate released");
                     self.release_notify.notify_waiters();
                 }
@@ -408,6 +439,8 @@ impl ConversationRuntimeStateService {
         match self.state.lock() {
             Ok(mut state) => {
                 let had_active_turn = state.active_turns.remove(conversation_id).is_some();
+                state.background_turns.remove(conversation_id);
+                state.revision += 1;
                 let had_cancelling = state.cancelling_conversations.remove(conversation_id);
                 state.deferred_cancels.remove(conversation_id);
                 if had_active_turn || had_cancelling {
@@ -429,6 +462,8 @@ impl ConversationRuntimeStateService {
         match self.state.lock() {
             Ok(mut state) => {
                 let had_active_turn = state.active_turns.remove(conversation_id).is_some();
+                state.background_turns.remove(conversation_id);
+                state.revision += 1;
                 let had_deleting = state.deleting_conversations.remove(conversation_id);
                 let had_cancelling = state.cancelling_conversations.remove(conversation_id);
                 let had_restarting = state.restarting_conversations.remove(conversation_id);
@@ -462,6 +497,7 @@ impl ConversationRuntimeStateService {
         match self.state.lock() {
             Ok(mut state) => {
                 state.shutting_down = true;
+                state.revision += 1;
                 let active_turn_count = state.active_turns.len();
                 info!(active_turn_count, "conversation runtime marked shutting down");
                 active_turn_count
@@ -508,17 +544,30 @@ impl ConversationRuntimeStateService {
         pending_confirmations: usize,
         supports_midturn_delivery: bool,
     ) -> ConversationRuntimeSummary {
-        let (active_turn_id, cancelling, restarting) = self
+        let (active_turn_id, cancel_turn_id, cancelling, restarting, revision) = self
             .state
             .lock()
             .map(|state| {
                 (
                     state.active_turns.get(conversation_id).cloned(),
+                    if state.shutting_down
+                        || state.deleting_conversations.contains(conversation_id)
+                        || state.restarting_conversations.contains(conversation_id)
+                    {
+                        None
+                    } else {
+                        state
+                            .active_turns
+                            .get(conversation_id)
+                            .or_else(|| state.background_turns.get(conversation_id))
+                            .cloned()
+                    },
                     state.cancelling_conversations.contains(conversation_id),
                     state.restarting_conversations.contains(conversation_id),
+                    state.revision,
                 )
             })
-            .unwrap_or((None, false, true));
+            .unwrap_or((None, None, false, true, 0));
         let claimed = active_turn_id.is_some();
 
         let state = if restarting {
@@ -545,6 +594,10 @@ impl ConversationRuntimeStateService {
             is_processing,
             pending_confirmations,
             turn_id: active_turn_id,
+            can_stop: cancel_turn_id.is_some(),
+            cancel_turn_id,
+            runtime_instance_id: self.instance_id.clone(),
+            runtime_revision: revision,
             supports_midturn_delivery,
         }
     }
@@ -575,6 +628,7 @@ impl ConversationRuntimeStateService {
 
                 let was_deleting = state.deleting_conversations.remove(conversation_id);
                 state.cancelling_conversations.remove(conversation_id);
+                state.revision += 1;
                 info!(
                     conversation_id,
                     turn_id,

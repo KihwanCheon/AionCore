@@ -803,6 +803,24 @@ impl ConversationService {
             persistence: self.runtime_persistence(),
             runtime_state: Arc::clone(&self.runtime_state),
             title_only,
+            runtime_snapshot: {
+                let state = self.runtime_state.clone();
+                // The watcher must not keep the manager (and its agent stream)
+                // alive after teardown merely to take a runtime snapshot.
+                let tasks = Arc::downgrade(&self.task_manager);
+                let conversation_id = conversation_id.to_owned();
+                let supports_midturn_delivery = agent.supports_midturn_delivery();
+                Arc::new(move || {
+                    let agent = tasks.upgrade().and_then(|tasks| tasks.get_task(&conversation_id));
+                    state.summary_from_parts(
+                        &conversation_id,
+                        agent.as_ref().and_then(|task| task.status()),
+                        agent.is_some(),
+                        agent.as_ref().map(|task| task.get_confirmations().len()).unwrap_or(0),
+                        supports_midturn_delivery,
+                    )
+                })
+            },
             pending_started_ttl: crate::background_stream::PENDING_STARTED_TTL,
         };
         let rx = agent.subscribe();
@@ -4699,7 +4717,7 @@ impl ConversationService {
                 id: conversation_id.to_owned(),
             })?;
 
-        let active_turn_id = self.runtime_state.active_turn_id_for(conversation_id);
+        let active_turn_id = self.runtime_state.cancel_turn_id_for(conversation_id);
         if active_turn_id.as_deref() != Some(turn_id) {
             info!(
                 conversation_id,
@@ -4719,6 +4737,13 @@ impl ConversationService {
             // its permission hook and writes the MCP config). Dropping the
             // request here loses it: the turn runs to completion while the user
             // has been told it stopped.
+            // A continuation cannot be waiting for its initial build. Its
+            // watcher releases the target as the removed instance's stream ends.
+            if self.runtime_state.active_turn_id_for(conversation_id).as_deref() != Some(turn_id) {
+                return Ok(CancelConversationResponse {
+                    runtime: self.runtime_summary_for(conversation_id).await,
+                });
+            }
             //
             // Record the intent instead. The orchestrator applies it as soon as
             // the task appears, so a cancel issued during the build behaves like
@@ -4739,7 +4764,11 @@ impl ConversationService {
             });
         };
 
-        self.runtime_state.mark_cancelling(conversation_id);
+        if !self.runtime_state.try_begin_cancel(conversation_id, turn_id) {
+            return Ok(CancelConversationResponse {
+                runtime: self.runtime_summary_for(conversation_id).await,
+            });
+        }
         if let Err(e) = agent.cancel().await {
             self.runtime_state.clear_cancelling(conversation_id);
             warn!(conversation_id, turn_id, error = %ErrorChain(&e), "Failed to cancel agent");
@@ -4747,7 +4776,7 @@ impl ConversationService {
         }
 
         // The watchdog is runtime-agnostic — it only checks whether the turn is
-        // still claimed and kills the task. agy cancels by killing its per-turn
+        // still cancellable and kills the task. agy cancels by killing its per-turn
         // child, but nothing guarantees the pump drains, and without this net a
         // stuck cancel leaves the conversation wedged with no way back.
         if matches!(agent.agent_type(), AgentType::Acp | AgentType::Antigravity) {
@@ -4758,7 +4787,7 @@ impl ConversationService {
 
             tokio::spawn(async move {
                 tokio::time::sleep(ACP_CANCEL_DRAIN_TIMEOUT).await;
-                if runtime_state.active_turn_id_for(&conv_id).as_deref() == Some(active_turn.as_str())
+                if runtime_state.cancel_turn_id_for(&conv_id).as_deref() == Some(active_turn.as_str())
                     && runtime_state.is_cancelling(&conv_id)
                 {
                     warn!(

@@ -225,6 +225,7 @@ pub struct SendMessageResponse {
 /// Body for `POST /api/conversations/:id/cancel`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CancelConversationRequest {
+    /// The current runtime.cancel_turn_id (foreground or CLI continuation).
     pub turn_id: String,
 }
 
@@ -254,6 +255,16 @@ pub struct ConversationRuntimeSummary {
     pub is_processing: bool,
     pub pending_confirmations: usize,
     pub turn_id: Option<String>,
+    /// Cancellation is independent from admission of a new user message.
+    #[serde(default)]
+    pub can_stop: bool,
+    #[serde(default)]
+    pub cancel_turn_id: Option<String>,
+    /// Orders runtime snapshots across HTTP responses and realtime events.
+    #[serde(default)]
+    pub runtime_instance_id: String,
+    #[serde(default)]
+    pub runtime_revision: u64,
     /// Whether a message sent right now reaches the agent without waiting for the
     /// current turn to end. The ONLY capability bit the frontend may gate mid-turn
     /// UI on — see `Capabilities::supports_midturn_delivery` for why
