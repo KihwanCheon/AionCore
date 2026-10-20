@@ -240,6 +240,10 @@ pub enum BackendError {
     CommandNotSupported { command: &'static str },
     #[error("backend transport error: {0}")]
     Transport(String),
+    /// The command was written, but its acknowledgement did not arrive. Delivery
+    /// may have succeeded, so callers must not automatically replay it.
+    #[error("message delivery could not be confirmed: {0}")]
+    DeliveryUnconfirmed(String),
     /// The session workspace (spawn cwd) is missing, not a directory, or not
     /// accessible. Carried as its own class (not `Transport`) so the app layer
     /// can keep the legacy #410 workspace-unavailable UX instead of an opaque

@@ -71,6 +71,22 @@ impl AgentSendError {
         Self::from_agent_error_ref(&err)
     }
 
+    /// Preserve uncertain delivery as non-retryable to prevent duplicate work.
+    pub fn from_backend_error(err: aionui_session::BackendError) -> Self {
+        match err {
+            aionui_session::BackendError::DeliveryUnconfirmed(_) => Self::new(
+                "Message delivery could not be confirmed",
+                AgentErrorCode::UnknownUpstreamError,
+                AgentErrorOwnership::UserAgent,
+                Some(err.to_string()),
+                false,
+                false,
+                None,
+            ),
+            err => Self::from_agent_error(AgentError::bad_gateway(err.to_string())),
+        }
+    }
+
     pub fn from_agent_error_ref(err: &AgentError) -> Self {
         let detail = err.public_message();
         match err {

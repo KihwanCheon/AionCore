@@ -678,7 +678,7 @@ impl SessionAgentTask {
             // Preserve the backend's message text: the conversation layer
             // classifies codex's "no active turn to steer" rejection to fall
             // back to the normal new-turn path.
-            .map_err(|e| AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string())))
+            .map_err(AgentSendError::from_backend_error)
     }
 
     /// DEV (`--dump-prompts`): dump this turn's final input blocks as a
@@ -1445,7 +1445,7 @@ impl IAgentTask for SessionAgentTask {
                     "Session not found: {detail}"
                 ))))
             }
-            Err(e) => Err(AgentSendError::from_agent_error(AgentError::bad_gateway(e.to_string()))),
+            Err(e) => Err(AgentSendError::from_backend_error(e)),
         }
     }
 
@@ -6674,6 +6674,67 @@ mod persist_tests {
             Some("high"),
             "the chosen effort must be persisted into config_selections"
         );
+    }
+
+    struct UnconfirmedDeliveryBackend;
+
+    #[async_trait::async_trait]
+    impl SessionBackend for UnconfirmedDeliveryBackend {
+        async fn dispatch(&self, command: Command) -> Result<CommandReceipt, BackendError> {
+            assert!(matches!(command, Command::Send { .. } | Command::Steer { .. }));
+            Err(BackendError::DeliveryUnconfirmed(
+                "turn/steer acknowledgement missing".into(),
+            ))
+        }
+
+        fn events(&self) -> BoxStream<'static, SessionEnvelope> {
+            use futures_util::StreamExt as _;
+            futures_util::stream::pending().boxed()
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn unconfirmed_delivery_is_not_retryable_on_send_or_midturn() {
+        let task = SessionAgentTask::new(
+            AgentType::Acp,
+            "conv-1".into(),
+            "user-1".into(),
+            "/w".into(),
+            Arc::new(UnconfirmedDeliveryBackend),
+            None,
+        );
+        for midturn in [false, true] {
+            let data = SendMessageData {
+                content: "do not replay".into(),
+                msg_id: "m1".into(),
+                turn_id: None,
+                files: Vec::new(),
+                inject_skills: Vec::new(),
+            };
+            let error = if midturn {
+                task.deliver_midturn(data).await
+            } else {
+                task.send_message(data).await
+            }
+            .expect_err("an unacknowledged write must remain unconfirmed");
+            assert_eq!(error.stream_error().retryable, Some(false));
+            assert_eq!(
+                error.ownership(),
+                Some(aionui_api_types::AgentErrorOwnership::UserAgent)
+            );
+            assert!(
+                error
+                    .stream_error()
+                    .detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("delivery could not be confirmed")
+            );
+        }
     }
 
     /// A backend whose dispatch reports the session as gone (codex resume-poison:

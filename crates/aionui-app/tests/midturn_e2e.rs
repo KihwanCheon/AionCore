@@ -216,9 +216,10 @@ async fn midturn_send_returns_200_with_the_active_turn_id() {
 
     // Delivered through the mid-turn path (not a second normal turn).
     let delivered = delivered.lock().await.clone();
+    assert_eq!(delivered.len(), 1, "exactly one mid-turn input must be delivered");
     assert_eq!(
-        delivered,
-        vec!["midturn interjection".to_owned()],
+        delivered[0].split("\n\n[AionUi choice notifications]\n").next(),
+        Some("midturn interjection"),
         "the message must go through the mid-turn delivery path"
     );
 

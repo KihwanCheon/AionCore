@@ -4039,20 +4039,8 @@ impl ConversationService {
                     msg_id = %user_msg_id,
                     "mid-turn delivery rejected (turn ended); opening a new turn"
                 );
-                if persisted {
-                    // The message now opens its own turn — it is no longer
-                    // waiting on a mid-turn receipt.
-                    apply_message_receipt(
-                        &self.conversation_repo,
-                        &self.broadcaster,
-                        user_id,
-                        conversation_id,
-                        &user_msg_id,
-                        MIDTURN_STATUS_RECEIVED,
-                        false,
-                    )
-                    .await;
-                }
+                // Keep the input pending until the fallback actually obtains
+                // its turn. The old relay can still hold its claim here.
                 Ok(MidturnOutcome::TurnEnded {
                     user_msg_id: persisted.then_some(user_msg_id),
                 })
@@ -4228,7 +4216,30 @@ impl ConversationService {
         // phantom turn id minted outside an actual claim must never exist.
         let (turn_id, turn_claim) = {
             let turn_id = Self::mint_turn_id();
-            let turn_claim = self.runtime_state.try_claim_turn(conversation_id, &turn_id)?;
+            let turn_claim = match self.runtime_state.try_claim_turn(conversation_id, &turn_id) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    if let Some(msg_id) = fallback_user_msg.as_deref() {
+                        apply_message_receipt(
+                            &self.conversation_repo,
+                            &self.broadcaster,
+                            user_id,
+                            conversation_id,
+                            msg_id,
+                            "error",
+                            true,
+                        )
+                        .await;
+                        warn!(
+                            conversation_id,
+                            msg_id,
+                            error = %ErrorChain(&error),
+                            "mid-turn fallback not admitted; input remains undelivered"
+                        );
+                    }
+                    return Err(error);
+                }
+            };
             (turn_id, turn_claim)
         };
 
@@ -4262,10 +4273,21 @@ impl ConversationService {
                 .await;
             return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
         }
-        // The TurnEnded fallback already persisted + broadcast this message
-        // (with the statusChanged flip) — doing it again would duplicate the
-        // row and the live-view bubble.
-        if !was_fallback {
+        // Only an admitted fallback becomes an ordinary accepted user message.
+        // Its existing row and bubble are reused; a failed claim above emits
+        // an error receipt without ever announcing successful receipt.
+        if was_fallback {
+            apply_message_receipt(
+                &self.conversation_repo,
+                &self.broadcaster,
+                user_id,
+                conversation_id,
+                &user_msg_id,
+                MIDTURN_STATUS_RECEIVED,
+                true,
+            )
+            .await;
+        } else {
             if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
                 warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
                 return Err(e.into());

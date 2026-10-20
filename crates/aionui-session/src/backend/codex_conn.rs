@@ -49,6 +49,8 @@ const CODEX_ENV_POLICY_INHERIT_ALL: &str = "shell_environment_policy.inherit=all
 const CODEX_ENV_POLICY_CLEAR_INCLUDE_ONLY: &str = "shell_environment_policy.include_only=[]";
 const AIONUI_CONVERSATION_ID_ENV: &str = "AIONUI_CONVERSATION_ID";
 
+mod thread_scope;
+
 /// Config overrides that make Codex command-execution children inherit the
 /// runtime environment injected into the app-server process.
 pub fn codex_shell_environment_policy_args() -> [&'static str; 4] {
@@ -797,7 +799,7 @@ fn builtin_slash_commands() -> Vec<crate::capability::SlashCommandInfo> {
 }
 
 /// How long dispatch(Steer) waits for the synchronous `turn/steer` RPC ack
-/// before degrading to fire-and-forget. The live ack is ~0ms (design spec
+/// before reporting unconfirmed delivery. The live ack is ~0ms (design spec
 /// §6.2); 5s is orders of magnitude of headroom while keeping a wedged pipe
 /// from blocking the send path indefinitely.
 const STEER_ACK_TIMEOUT_MS: u64 = 5_000;
@@ -925,8 +927,8 @@ pub struct CodexSessionBackend {
     /// rejects with a bare -32600 whose MESSAGE is the only discriminator,
     /// §6甲.1).
     pending_steers: Arc<Mutex<HashMap<u64, PendingSteer>>>,
-    /// How long dispatch(Steer) waits for the ack before degrading to
-    /// fire-and-forget (Ok + warn). Milliseconds; injectable for tests.
+    /// How long dispatch(Steer) waits before reporting unconfirmed delivery.
+    /// Milliseconds; injectable for tests.
     steer_ack_timeout_ms: AtomicU64,
 }
 
@@ -1227,7 +1229,7 @@ impl CodexSessionBackend {
     }
 
     /// Test-support seam: shrink the steer-ack await so a fixture without a
-    /// scripted `turn/steer` response exercises the fire-and-forget degradation
+    /// scripted `turn/steer` response exercises unconfirmed delivery
     /// without stalling the test for the production timeout.
     #[cfg(any(test, feature = "test-support"))]
     pub fn set_steer_ack_timeout_for_test(&self, ms: u64) {
@@ -1740,6 +1742,31 @@ async fn reader_task(
                         // server notification → SessionEvent(s)
                         let cur = turn_gen.load(Ordering::SeqCst);
                         let params = frame.get("params").unwrap_or(&Value::Null);
+                        let bound_thread = thread_binding.lock().await.clone();
+                        let active_turn = active_turn_id.lock().await.clone();
+                        if let Some(reason) =
+                            thread_scope::ignore_reason(m, params, bound_thread.as_deref(), active_turn.as_deref())
+                        {
+                            if matches!(
+                                m,
+                                "thread/started"
+                                    | "thread/status/changed"
+                                    | "turn/started"
+                                    | "turn/completed"
+                                    | "error"
+                            ) {
+                                tracing::info!(
+                                    conversation_id = %session_id,
+                                    method = m,
+                                    ?reason,
+                                    bound_thread_id = ?bound_thread,
+                                    notification_thread_id = ?thread_scope::notification_thread_id(m, params),
+                                    active_turn_id = ?active_turn,
+                                    "codex ignored out-of-scope lifecycle notification"
+                                );
+                            }
+                            continue;
+                        }
                         if m == "thread/started" {
                             // bind threadId (backend transport key, kept private).
                             if let Some(tid) = params.get("thread").and_then(|t| t.get("id")).and_then(Value::as_str) {
@@ -3991,21 +4018,18 @@ impl SessionBackend for CodexSessionBackend {
                         turn_gen: self.turn_gen.load(Ordering::SeqCst),
                     });
                 }
-                // 009 R1c: a flight-period Send (a turn is already active) must NOT
-                // open a second turn_gen. codex's app-server merges an overlapping
-                // input into the live turn under a SINGLE turnId (verified:
-                // concurrent_turn_start_merge.jsonl) — issuing a second `turn/start`
-                // + fetch_add would phantom-split one wire turn across two turn_gen
-                // buckets downstream (GROUP BY turn_gen). Mirror the Cancel arm's
-                // active_turn_id probe: accept as NoTurn, no frame, no fetch_add.
-                // (Slash commands during a live turn fold in as plain text — same
-                // merge semantics as any other flight-period input.)
-                if self.active_turn_id.lock().await.is_some() {
-                    return Ok(CommandReceipt {
-                        accepted: true,
-                        admission: Admission::NoTurn,
-                        turn_gen: self.turn_gen.load(Ordering::SeqCst),
-                    });
+                // Preserve one turn generation, but actually deliver overlapping
+                // input through the acknowledged steer path. Returning NoTurn
+                // without a frame silently discarded the user's message.
+                // The turn/steer contract and rejection handling live below.
+                let has_active_turn = self.active_turn_id.lock().await.is_some();
+                if has_active_turn {
+                    return self
+                        .dispatch(Command::Steer {
+                            content,
+                            client_msg_id: metadata.client_msg_id,
+                        })
+                        .await;
                 }
                 // F-4: ensure the app-server is awake before the wire write. When
                 // idle_ttl=None (default) the slot is always Active → one
@@ -4220,21 +4244,19 @@ impl SessionBackend for CodexSessionBackend {
                             );
                             return Err(BackendError::Transport(format!("turn/steer rejected: {msg}")));
                         }
-                        // Ack lost (reader gone) or timed out: degrade to the old
-                        // fire-and-forget contract — the frame is already written,
-                        // and blocking the send path on a wedged pipe is worse.
+                        // The frame may have reached Codex, so do not replay it
+                        // automatically. An absent acknowledgement cannot prove
+                        // delivery; surface uncertainty instead of false success.
                         Ok(Err(_)) | Err(_) => {
                             self.pending_steers.lock().await.remove(&id);
                             tracing::warn!(
                                 conversation_id = %self.session_id,
                                 timeout_ms = ack_timeout.as_millis() as u64,
-                                "turn/steer ack not received; assuming delivered (fire-and-forget degradation)"
+                                "turn/steer acknowledgement missing; delivery unconfirmed"
                             );
-                            return Ok(CommandReceipt {
-                                accepted: true,
-                                admission: Admission::NoTurn,
-                                turn_gen: self.turn_gen.load(Ordering::SeqCst),
-                            });
+                            return Err(BackendError::DeliveryUnconfirmed(
+                                "turn/steer acknowledgement missing".into(),
+                            ));
                         }
                     }
                 }
@@ -4964,7 +4986,7 @@ mod tests {
 
     /// Build a FakeAgentIo replaying codex JSON-RPC lines, then collect the
     /// SessionEvents the backend surfaces (excluding the EOF Detached).
-    async fn drive_codex(lines: &[&str]) -> Vec<SessionEvent> {
+    pub(super) async fn drive_codex(lines: &[&str]) -> Vec<SessionEvent> {
         let bytes = format!("{}\n", lines.join("\n")).into_bytes();
         let fake = FakeAgentIo::new(
             bytes,
@@ -6816,35 +6838,44 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_send_during_active_turn_is_noturn_and_opens_no_second_turn_gen() {
-        use futures_util::StreamExt as _;
-        // 009 R1c: a flight-period Send (a turn is already active) must NOT open a
-        // second turn_gen. codex merges the overlapping input into the live turn
-        // under one turnId; issuing a second turn/start + fetch_add would phantom-
-        // split one wire turn across two turn_gen buckets downstream. Mirror the
-        // Cancel arm: accept as NoTurn, write no frame, leave turn_gen unchanged.
-        let fake = fake_with_binding("th-77", Some("turn-A"));
+        // An overlapping Send must reach the active turn, without opening a
+        // second generation. A no-op accepted receipt would lose this input.
+        let fake = fake_with_binding("th-77", Some("turn-A"))
+            .with_gated_tail(format!("{}\n", r#"{"jsonrpc":"2.0","id":1,"result":{"turnId":"turn-A"}}"#).into_bytes());
         let captured = fake.captured_stdin();
-        let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
-        // Drive the event stream until the binding's turn/started settles, so
-        // active_turn_id is populated by the reader BEFORE we dispatch (mirrors
-        // dispatch_rewind_while_turn_in_flight).
-        let mut events = backend.events();
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            while let Some(env) = events.next().await {
-                if matches!(env.event, SessionEvent::TurnStarted { .. }) {
-                    break;
-                }
+        let release = fake.stdout_releaser();
+        let backend = Arc::new(CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while backend.active_turn_id.lock().await.is_none() {
+                tokio::task::yield_now().await;
             }
         })
-        .await;
+        .await
+        .expect("active turn bound");
         let gen_before = backend.turn_gen.load(Ordering::SeqCst);
-        let receipt = backend
-            .dispatch(Command::Send {
-                content: vec![ContentBlock::Text("second prompt".into())],
-                metadata: super::super::types::CommandMeta::default(),
+        let dispatch = {
+            let backend = Arc::clone(&backend);
+            tokio::spawn(async move {
+                backend
+                    .dispatch(Command::Send {
+                        content: vec![ContentBlock::Text("second prompt".into())],
+                        metadata: super::super::types::CommandMeta {
+                            client_msg_id: Some("second-message".into()),
+                            ..Default::default()
+                        },
+                    })
+                    .await
             })
-            .await
-            .expect("accepted");
+        };
+        let written = captured_str(&captured).await;
+        assert!(
+            written.contains(r#""method":"turn/steer""#),
+            "input must reach Codex: {written}"
+        );
+        assert!(written.contains("second prompt") && written.contains("second-message"));
+        assert!(!dispatch.is_finished(), "delivery must wait for the acknowledgement");
+        release();
+        let receipt = dispatch.await.unwrap().expect("acknowledged");
         assert_eq!(
             receipt.admission,
             Admission::NoTurn,
@@ -6859,7 +6890,6 @@ mod tests {
             gen_before,
             "no fetch_add happened"
         );
-        let written = captured_str(&captured).await;
         assert!(
             !written.contains(r#""method":"turn/start""#),
             "must NOT write a second turn/start frame, got: {written}"
@@ -7244,25 +7274,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispatch_steer_writes_turn_steer_with_expected_turn_id() {
+    async fn dispatch_steer_without_ack_reports_unconfirmed_delivery() {
         // R6/B5 Steer → `turn/steer{threadId, expectedTurnId, input,
         // clientUserMessageId}` (soft injection; NoTurn admission — no new
         // turn_gen). The expectedTurnId is the active turn; clientUserMessageId
         // is the mid-turn correlation id (official schema, design spec §6甲.10).
-        // No response is scripted → the ack await degrades to fire-and-forget
-        // after the (shortened) timeout, still returning an accepted receipt.
+        // No response is scripted. Writing the frame alone must not produce an
+        // accepted receipt, and the uncertain input must not be auto-replayed.
         let fake = fake_with_binding("th-3", Some("turn-X"));
         let captured = fake.captured_stdin();
         let backend = CodexSessionBackend::build_with_io("codex-1", Box::new(fake)).await;
         backend.set_steer_ack_timeout_for_test(100);
-        let receipt = backend
+        let error = backend
             .dispatch(Command::Steer {
                 content: vec![ContentBlock::Text("STEERED".into())],
                 client_msg_id: Some("cmsg-7".into()),
             })
             .await
-            .expect("accepted");
-        assert_eq!(receipt.admission, Admission::NoTurn, "steer folds into the live turn");
+            .expect_err("missing acknowledgement must not report delivery");
+        assert!(
+            matches!(error, BackendError::DeliveryUnconfirmed(ref message) if message.contains("acknowledgement missing"))
+        );
+        assert!(backend.pending_steers.lock().await.is_empty());
         let written = captured_str(&captured).await;
         assert!(
             written.contains(r#""method":"turn/steer""#),
@@ -7277,6 +7310,7 @@ mod tests {
             "carries the correlation id so codex round-trips it (§6甲.10), got: {written}"
         );
         assert!(written.contains("STEERED"), "carries the steer text, got: {written}");
+        assert_eq!(written.lines().count(), 1, "uncertain input must not be replayed");
     }
 
     #[tokio::test]

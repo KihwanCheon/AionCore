@@ -4539,6 +4539,52 @@ async fn midturn_steer_rejection_turn_ended_falls_back_to_a_new_turn() {
     wait_for_turn_released(&svc, &conv.id).await;
 }
 
+#[tokio::test]
+async fn midturn_fallback_claim_conflict_marks_undelivered_message_as_error() {
+    let (svc, broadcaster, repo, _d) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    // Keep the claim outside the mock: the native turn ended, but the Core
+    // relay has not released its claim (the observed failure on 2026-10-20).
+    let _claim = svc.runtime_state().try_claim_turn(&conv.id, "turn_active").unwrap();
+    let agent = Arc::new(MidturnMockAgent::new(&conv.id));
+    *agent.scripted_error.lock().unwrap() = Some(AgentSendError::from_agent_error(AgentError::bad_gateway(
+        "backend transport error: no active turn to steer",
+    )));
+    let task_mgr = Arc::new(MockTaskManager::new());
+    task_mgr.insert_agent(&conv.id, AgentInstance::Mock(agent));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr;
+    broadcaster.take_events();
+
+    let result = svc
+        .send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await;
+
+    assert!(matches!(result, Err(ConversationError::Busy { .. })));
+    let rows = repo.messages.lock().unwrap();
+    let user_rows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.position.as_deref() == Some("right"))
+        .collect();
+    assert_eq!(user_rows.len(), 1);
+    assert_eq!(user_rows[0].status.as_deref(), Some("error"));
+    let msg_id = user_rows[0].msg_id.as_deref().unwrap();
+    let receipts: Vec<_> = broadcaster
+        .take_events()
+        .into_iter()
+        .filter(|event| event.name == "message.statusChanged" && event.data["msg_id"] == msg_id)
+        .map(|event| event.data["status"].clone())
+        .collect();
+    assert_eq!(
+        receipts,
+        [serde_json::json!("error")],
+        "an undelivered input must never emit a received receipt"
+    );
+    assert_eq!(
+        svc.runtime_state().active_turn_id_for(&conv.id).as_deref(),
+        Some("turn_active")
+    );
+}
+
 /// §4.6 (review fix): a turn blocked on a pending permission confirmation
 /// must NOT be steered into, even for a supporting backend — the mid-turn
 /// branch falls through to the claim, restoring the exact pre-B5 409 at the
@@ -7441,6 +7487,58 @@ async fn send_message_recovers_when_finished_task_has_no_runtime_terminal() {
     let messages = repo_messages_asc(&repo, &conv.id, 20).await;
     let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
     assert!(tips.is_empty());
+}
+
+#[tokio::test]
+async fn send_message_does_not_auto_replay_unconfirmed_delivery() {
+    let (svc, _broadcaster, repo, _default_task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let error = AgentSendError::from_backend_error(aionui_session::BackendError::DeliveryUnconfirmed(
+        "turn/steer acknowledgement missing".into(),
+    ));
+    let first = Arc::new(
+        ScriptedAgent::new(&conv.id, vec![vec![]])
+            .with_status(None)
+            .with_send_error(error),
+    );
+    let second = Arc::new(ScriptedAgent::new(
+        &conv.id,
+        vec![vec![AgentStreamEvent::Finish(FinishEventData::default())]],
+    ));
+    let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![
+        AgentInstance::Mock(first.clone()),
+        AgentInstance::Mock(second.clone()),
+    ]));
+    let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+
+    svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+        .await
+        .unwrap();
+    wait_for_turn_released(&svc, &conv.id).await;
+
+    assert_eq!(
+        task_mgr.build_count(),
+        1,
+        "an unconfirmed write must not trigger replay"
+    );
+    let sent = first.sent_contents();
+    assert_eq!(sent.len(), 1, "the original input must be dispatched exactly once");
+    assert_eq!(
+        sent[0].split("\n\n[AionUi choice notifications]\n").next(),
+        Some("Hello")
+    );
+    assert!(second.sent_contents().is_empty());
+    let messages = repo_messages_asc(&repo, &conv.id, 20).await;
+    let tips: Vec<_> = messages.iter().filter(|msg| msg.r#type == "tips").collect();
+    assert_eq!(tips.len(), 1, "uncertain delivery must remain visible");
+    let content: serde_json::Value = serde_json::from_str(&tips[0].content).unwrap();
+    assert_eq!(content["error"]["retryable"], false);
+    assert!(
+        content["error"]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("delivery could not be confirmed")
+    );
 }
 
 #[tokio::test]
