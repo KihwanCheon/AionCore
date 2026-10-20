@@ -78,6 +78,7 @@ fn runtime_init_error_for_command(command: &Option<Command>, error: std::io::Err
 async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError> {
     // MCP stdio helpers must not touch the database, logging setup, or `AppServices`.
     match cli.command {
+        Some(Command::Database { compact }) => Ok(commands::cmd_database::run_database(&cli.data_dir, compact).await),
         Some(Command::Capabilities) => Ok(commands::run_capabilities()),
         Some(Command::Config(args)) => Ok(commands::run_config(args).await),
         Some(Command::Diagnose(args)) => Ok(commands::run_diagnose(args).await),

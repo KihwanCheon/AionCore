@@ -17,6 +17,7 @@ impl ConversationRuntimeStateService {
     ) -> Option<BackgroundTurn> {
         let mut state = self.state.lock().ok()?;
         if state.shutting_down
+            || state.database_maintenance_active()
             || state.deleting_conversations.contains(conversation_id)
             || state.restarting_conversations.contains(conversation_id)
             || state.cancelling_conversations.contains(conversation_id)

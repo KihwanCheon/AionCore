@@ -7,6 +7,7 @@ pub(crate) mod cmd_antigravity_hook;
 pub(crate) mod cmd_capabilities;
 pub(crate) mod cmd_config;
 pub(crate) mod cmd_conversation;
+pub(crate) mod cmd_database;
 pub(crate) mod cmd_diagnose;
 pub(crate) mod cmd_doctor;
 pub(crate) mod cmd_prepare_managed_resources;

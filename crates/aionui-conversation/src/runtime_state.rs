@@ -1,6 +1,7 @@
 mod background;
 #[cfg(test)]
 mod background_tests;
+mod database_maintenance;
 
 use std::{
     collections::{HashMap, HashSet},
@@ -47,6 +48,7 @@ struct ConversationRuntimeState {
     /// time. See [`ConversationRuntimeStateService::should_log_once_for_turn`].
     logged_once_per_turn: HashMap<(OncePerTurn, String), String>,
     shutting_down: bool,
+    database_maintenance: Option<(String, std::time::Instant)>,
 }
 
 /// Events that are worth one log line per turn rather than one per attempt.
@@ -92,13 +94,13 @@ impl ConversationRuntimeStateService {
             ConversationError::internal("conversation runtime state lock poisoned")
         })?;
 
-        if state.shutting_down {
+        if state.shutting_down || state.database_maintenance_active() {
             info!(
                 conversation_id,
-                turn_id, "conversation runtime turn claim rejected because runtime is shutting down"
+                turn_id, "conversation runtime turn claim rejected during shutdown or database maintenance"
             );
             return Err(ConversationError::Busy {
-                reason: "conversation runtime is shutting down".into(),
+                reason: "conversation runtime is shutting down or undergoing database maintenance".into(),
             });
         }
 
@@ -352,9 +354,9 @@ impl ConversationRuntimeStateService {
             .state
             .lock()
             .map_err(|_| ConversationError::internal("conversation runtime state lock poisoned"))?;
-        if state.shutting_down {
+        if state.shutting_down || state.database_maintenance_active() {
             return Err(ConversationError::Busy {
-                reason: "conversation runtime is shutting down".into(),
+                reason: "conversation runtime is shutting down or undergoing database maintenance".into(),
             });
         }
         if state.deleting_conversations.contains(conversation_id) {

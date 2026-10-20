@@ -120,6 +120,14 @@ impl From<ConversationError> for ApiError {
 pub fn conversation_routes(state: ConversationRouterState) -> Router {
     Router::new()
         .route(
+            "/api/system/database-maintenance/prepare",
+            post(prepare_database_maintenance),
+        )
+        .route(
+            "/api/system/database-maintenance/release",
+            post(release_database_maintenance),
+        )
+        .route(
             "/api/choice-notifications",
             get(list_choice_notices).post(register_choice_notice),
         )
@@ -156,6 +164,38 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/clone", post(clone))
         .route("/api/messages/search", get(search_messages))
         .with_state(state)
+}
+
+async fn prepare_database_maintenance(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<String>>, ApiError> {
+    require_local_maintenance_owner(&user)?;
+    let token = state
+        .service
+        .runtime_state()
+        .prepare_database_maintenance()
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(token)))
+}
+
+async fn release_database_maintenance(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(token): Json<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    require_local_maintenance_owner(&user)?;
+    state.service.runtime_state().release_database_maintenance(&token);
+    Ok(Json(ApiResponse::success()))
+}
+
+fn require_local_maintenance_owner(user: &CurrentUser) -> Result<(), ApiError> {
+    if user.id != "system_default_user" || user.user_type != aionui_db::UserType::Local {
+        return Err(ApiError::Forbidden(
+            "Database maintenance requires the local desktop owner".into(),
+        ));
+    }
+    Ok(())
 }
 
 // ── Handlers ───────────────────────────────────────────────────────

@@ -106,6 +106,11 @@ impl From<ManagedResourcesModeArg> for aionui_runtime::ManagedResourcesMode {
 // which spawns it from `session/new.mcpServers`) depend on verbatim.
 #[derive(Subcommand, Debug)]
 pub(crate) enum Command {
+    /// Inspect local database usage, or compact it while the server is stopped.
+    Database {
+        #[arg(long)]
+        compact: bool,
+    },
     /// Print the top-level agent-facing CLI capability index.
     Capabilities,
     /// Agent-facing automation CLI for AionUi configuration.
@@ -158,6 +163,7 @@ pub(crate) enum Command {
 impl Command {
     pub(crate) fn as_str(&self) -> &'static str {
         match self {
+            Self::Database { .. } => "database",
             Self::Capabilities => "capabilities",
             Self::Config(_) => "config",
             Self::Diagnose(_) => "diagnose",
