@@ -217,3 +217,121 @@ async fn external_report_rejects_invalid_payload_and_foreign_or_missing_conversa
     ));
     assert_eq!(tasks.active_count(), 0);
 }
+
+/// Records outbound prompts so the dispatch seam can be checked end to end.
+struct PromptCaptureAgent {
+    conversation_id: String,
+    workspace: String,
+    event_tx: broadcast::Sender<AgentStreamEvent>,
+    sent: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl IAgentTask for PromptCaptureAgent {
+    fn agent_type(&self) -> AgentType {
+        AgentType::Acp
+    }
+    fn conversation_id(&self) -> &str {
+        &self.conversation_id
+    }
+    fn workspace(&self) -> &str {
+        &self.workspace
+    }
+    fn status(&self) -> Option<ConversationStatus> {
+        None
+    }
+    fn last_activity_at(&self) -> TimestampMs {
+        0
+    }
+    fn subscribe(&self) -> broadcast::Receiver<AgentStreamEvent> {
+        self.event_tx.subscribe()
+    }
+    async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
+        self.sent.lock().unwrap().push(data.content);
+        let _ = self.event_tx.send(AgentStreamEvent::Finish(FinishEventData::default()));
+        Ok(())
+    }
+    async fn cancel(&self) -> Result<(), AgentError> {
+        Ok(())
+    }
+    fn kill(&self, _reason: Option<AgentKillReason>) -> Result<(), AgentError> {
+        Ok(())
+    }
+}
+
+impl IMockAgent for PromptCaptureAgent {}
+
+#[tokio::test]
+async fn external_dispatch_turn_omits_choice_notice_but_user_turn_keeps_it() {
+    const NOTICE_HEADER: &str = "[AionUi choice notifications]";
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+    let events = Arc::new(MockBroadcaster::new());
+    let tasks = Arc::new(MockTaskManager::new());
+    let svc = service(repo.clone(), events.clone(), tasks.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let (event_tx, _) = broadcast::channel(16);
+    let capture = Arc::new(PromptCaptureAgent {
+        conversation_id: conv.id.clone(),
+        workspace: ensure_test_workspace_path(),
+        event_tx,
+        sent: Default::default(),
+    });
+    tasks.insert_agent(&conv.id, AgentInstance::Mock(capture.clone()));
+
+    let dispatcher = crate::external_dispatch::ExternalConversationDispatchService::new(
+        svc.clone(),
+        Arc::new(aionui_db::fork_extensions::SqliteExternalDispatchRepository::new(
+            db.pool().clone(),
+        )),
+    );
+    let instruction = "# MindNProgress 하위 카드 위임 작업 요청\n위임 범위를 수행하고 결과를 보고한다.";
+    let request: aionui_api_types::ExternalConversationDispatchRequest = serde_json::from_value(json!({
+        "operationId": "dispatch-without-choice-notice", "actorConversationId": conv.id,
+        "targetConversationId": conv.id, "strategy": "resume", "instruction": instruction,
+    }))
+    .unwrap();
+    dispatcher.dispatch(request).await.unwrap();
+    let mut finished = false;
+    for _ in 0..100 {
+        let state = dispatcher
+            .status("dispatch-without-choice-notice")
+            .await
+            .unwrap()
+            .unwrap();
+        if state.state == aionui_api_types::ExternalConversationDispatchState::Completed {
+            finished = true;
+            break;
+        }
+        assert_ne!(
+            state.state,
+            aionui_api_types::ExternalConversationDispatchState::Failed,
+            "{state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(finished, "capture agent should finish the dispatched turn");
+
+    svc.run_agent_turn(ConversationAgentTurnRequest {
+        user_id: "user_1".into(),
+        conversation_id: conv.id.clone(),
+        content: "일반 요청".into(),
+        files: vec![],
+        inject_skills: vec![],
+        required_runtime_mode: None,
+        persist_user_message: false,
+        user_message_hidden: false,
+        on_resource_waiting: None,
+        on_started: None,
+    })
+    .await
+    .unwrap();
+
+    let sent = capture.sent.lock().unwrap().clone();
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], instruction);
+    assert!(!sent[0].contains(NOTICE_HEADER));
+    assert!(sent[1].starts_with("일반 요청"));
+    assert!(sent[1].contains(NOTICE_HEADER));
+}

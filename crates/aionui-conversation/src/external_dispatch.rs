@@ -4,6 +4,9 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use aionui_ai_agent::capability::user_choice_notice::{
+    release_user_choice_notice_for_turn, suppress_user_choice_notice_for_turn,
+};
 use aionui_api_types::{
     AssistantConversationOverridesRequest, AssistantConversationRequest,
     ConfirmExternalConversationDispatchCompletionRequest, ConfirmExternalConversationDispatchCompletionResponse,
@@ -244,6 +247,9 @@ impl ExternalConversationDispatchService {
                             })
                         })),
                         on_started: Some(Arc::new(move |started| {
+                            // The dispatched turn reports to the orchestrating AI, not to
+                            // the user, so it must not carry the choice-notice contract.
+                            suppress_user_choice_notice_for_turn(&started.turn_id);
                             let started_service = started_service.clone();
                             let operation_id = started_operation_id.clone();
                             Box::pin(async move {
@@ -265,6 +271,9 @@ impl ExternalConversationDispatchService {
                     workspace_rebind.as_deref(),
                 )
                 .await;
+            if let Ok(outcome) = &outcome {
+                release_user_choice_notice_for_turn(&outcome.turn_id);
+            }
 
             match outcome {
                 Ok(mut outcome) => {

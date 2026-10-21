@@ -274,7 +274,7 @@ impl AgentInstance {
     /// Send a user message to the agent.
     pub async fn send_message(&self, data: SendMessageData) -> Result<(), AgentSendError> {
         self.as_task()
-            .send_message(crate::capability::user_choice_notice::with_user_choice_notice(data))
+            .send_message(crate::capability::user_choice_notice::with_turn_user_choice_notice(data))
             .await
     }
 
