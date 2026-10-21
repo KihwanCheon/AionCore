@@ -14,7 +14,11 @@ to reply.
 
 1. Use this ONLY when the user selected a target conversation with `@@`, or
    explicitly asked you to communicate with another conversation. Never deliver
-   a message on your own initiative.
+   a message on your own initiative. One narrow exception: a MindNProgress
+   group document instruction is delivered with the user's approval, so when its
+   text names the conversation to report back to and says to report through
+   this skill, treat that as an explicit request — send only to that
+   conversation, only as many times as the instruction says.
 2. `to` must be a conversation id. Names are not addresses, and there is no
    broadcast — one `send-message` call reaches exactly one conversation.
 3. Never pass, inline, export, echo, or set any `AIONUI_...` environment variable.
