@@ -597,6 +597,9 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
 fn thread_resume_params(config: &SessionConfig, thread_id: &str) -> HandshakeParams {
     let HandshakeParams(mut params) = thread_start_params(config);
     params["threadId"] = json!(thread_id);
+    // Omit unused history to avoid deprecated full hydration (verified: codex
+    // 0.163.0 `app-server generate-json-schema`, v2/ThreadResumeParams.json).
+    params["excludeTurns"] = json!(true);
     HandshakeParams(params)
 }
 
@@ -609,6 +612,9 @@ fn thread_resume_params(config: &SessionConfig, thread_id: &str) -> HandshakePar
 fn thread_fork_params(config: &SessionConfig, parent_thread_id: &str, last_turn_id: Option<&str>) -> HandshakeParams {
     let HandshakeParams(mut params) = thread_start_params(config);
     params["threadId"] = json!(parent_thread_id);
+    // Fork responses also carry unused history (verified: codex 0.163.0
+    // `app-server generate-json-schema`, v2/ThreadForkParams.json).
+    params["excludeTurns"] = json!(true);
     if let Some(turn_id) = last_turn_id {
         params["lastTurnId"] = json!(turn_id);
     }
@@ -8322,6 +8328,55 @@ mod tests {
         assert!(bare["params"].get("config").is_none());
         assert!(bare["params"].get("developerInstructions").is_none());
         assert!(bare["params"].get("baseInstructions").is_none());
+    }
+
+    /// The initial open and idle-wake handshake share the same wire contract.
+    /// Resume/fork must opt out of full-history hydration; fresh starts must not
+    /// receive this method-specific flag (verified: codex 0.163.0
+    /// `app-server generate-json-schema`, v2/Thread{Start,Resume,Fork}Params.json).
+    #[tokio::test]
+    async fn thread_handshake_excludes_history_only_on_resume_and_fork() {
+        for (mode, method, last_turn_id) in [
+            (HandshakeMode::Fresh, "thread/start", None),
+            (HandshakeMode::Resume("th-parent"), "thread/resume", None),
+            (
+                HandshakeMode::Fork {
+                    parent_thread_id: "th-parent",
+                    last_turn_id: None,
+                },
+                "thread/fork",
+                None,
+            ),
+            (
+                HandshakeMode::Fork {
+                    parent_thread_id: "th-parent",
+                    last_turn_id: Some("turn-3"),
+                },
+                "thread/fork",
+                Some("turn-3"),
+            ),
+        ] {
+            let fake = FakeAgentIo::never_exits(Vec::new());
+            let captured = fake.captured_stdin();
+            let backend = CodexSessionBackend::build_with_io("codex-history", Box::new(fake)).await;
+            backend.run_handshake(mode).await.expect("handshake writes");
+
+            let written = captured_str(&captured).await;
+            let frame = written
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("JSON-RPC frame"))
+                .find(|frame| frame["method"] == method)
+                .expect("thread request was written");
+            let params = &frame["params"];
+            if method == "thread/start" {
+                assert!(params.get("excludeTurns").is_none());
+                assert!(params.get("threadId").is_none());
+            } else {
+                assert_eq!(params["excludeTurns"], true, "{method} must omit full history");
+                assert_eq!(params["threadId"], "th-parent");
+            }
+            assert_eq!(params.get("lastTurnId").and_then(Value::as_str), last_turn_id);
+        }
     }
 
     /// R4 live spawn: open_session MUST route through the INJECTED Spawner (S14,
