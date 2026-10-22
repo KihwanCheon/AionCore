@@ -361,6 +361,7 @@ mod tests {
                 card_id: "card-1".to_owned(),
                 card_title: "Card".to_owned(),
                 archived: false,
+                title_prefix: None,
                 group: None,
             }),
             selection_available: false,
@@ -484,7 +485,8 @@ mod tests {
                             "documentTitle": "Document",
                             "cardId": "card-1",
                             "cardTitle": "Card",
-                            "archived": false
+                            "archived": false,
+                            "titlePrefix": "[상위] "
                         },
                         "deliveredClientCount": 1,
                         "requestedAt": "2026-09-15T00:00:00.000Z",
@@ -519,6 +521,11 @@ mod tests {
         .unwrap();
 
         assert!(response.selected);
+        assert_eq!(response.target.title_prefix.as_deref(), Some("[상위] "));
+        assert_eq!(
+            serde_json::to_value(&response).unwrap()["target"]["titlePrefix"],
+            "[상위] "
+        );
         assert_eq!(
             observed_authorization.lock().unwrap().as_deref(),
             Some("Bearer secret-token")
