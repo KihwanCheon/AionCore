@@ -21,10 +21,11 @@ Use this marker only for a genuine new question, never in quotes, code, examples
 /// (for example a dispatch whose turn failed before an outcome was returned).
 const MAX_SUPPRESSED_TURNS: usize = 256;
 
-/// Turn ids started by an external orchestrator (MindNProgress delegation,
-/// parent wake, group document instruction). Their final answer is captured as
-/// the dispatch result for another AI, so the user-facing approval-marker
-/// contract must not be injected into those prompts.
+/// Turn ids of MindNProgress child delegation turns only. Their final answer is
+/// captured as the dispatch result for another AI, so the user-facing
+/// approval-marker contract must not be injected into those prompts. Parent
+/// wakes, integration/recovery wakes, group document instructions and Dooray
+/// response resumes face the user and are never registered here.
 static SUPPRESSED_TURNS: std::sync::Mutex<std::collections::VecDeque<String>> =
     std::sync::Mutex::new(std::collections::VecDeque::new());
 

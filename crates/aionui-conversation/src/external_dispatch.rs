@@ -208,11 +208,14 @@ impl ExternalConversationDispatchService {
         let workspace_rebind = (request.strategy == ExternalConversationDispatchStrategy::Resume)
             .then(|| request.workspace_lease.as_ref().map(|lease| lease.project_root.clone()))
             .flatten();
+        let suppress_choice_notice = suppresses_user_choice_notice(&request, &conversation_id);
         let instruction = request.instruction;
         let persist_user_message = request.history_message_id.is_none();
         let release_workspace_runtime = request.workspace_lease.is_some();
         let explicit_completion_after_interruption = request.explicit_completion_after_interruption;
+        let suppressed_choice_notice_turn = SuppressedChoiceNoticeTurn::default();
         tokio::spawn(async move {
+            let started_suppressed_choice_notice_turn = suppressed_choice_notice_turn.clone();
             let started_service = service.clone();
             let started_operation_id = operation_id.clone();
             let waiting_service = service.clone();
@@ -247,9 +250,11 @@ impl ExternalConversationDispatchService {
                             })
                         })),
                         on_started: Some(Arc::new(move |started| {
-                            // The dispatched turn reports to the orchestrating AI, not to
-                            // the user, so it must not carry the choice-notice contract.
-                            suppress_user_choice_notice_for_turn(&started.turn_id);
+                            // Only child delegation turns report solely to the orchestrating
+                            // AI; every other dispatch keeps the choice-notice contract.
+                            if suppress_choice_notice {
+                                started_suppressed_choice_notice_turn.suppress(&started.turn_id);
+                            }
                             let started_service = started_service.clone();
                             let operation_id = started_operation_id.clone();
                             Box::pin(async move {
@@ -271,9 +276,8 @@ impl ExternalConversationDispatchService {
                     workspace_rebind.as_deref(),
                 )
                 .await;
-            if let Ok(outcome) = &outcome {
-                release_user_choice_notice_for_turn(&outcome.turn_id);
-            }
+            // Release on both Ok and Err so a failed dispatch never leaves its turn suppressed.
+            suppressed_choice_notice_turn.release();
 
             match outcome {
                 Ok(mut outcome) => {
@@ -655,6 +659,42 @@ fn deserialize_response(
     Ok(response)
 }
 
+/// The dispatch request carries no purpose field, so the child delegation turn is
+/// identified by the MindNProgress wire shape: it targets a conversation other than
+/// the actor and requests explicit completion after an interruption. Parent wakes,
+/// integration/recovery wakes and Dooray resumes target the actor itself, and group
+/// document instructions never request explicit completion, so they all keep the
+/// user-facing choice-notice contract.
+fn suppresses_user_choice_notice(request: &ExternalConversationDispatchRequest, target_conversation_id: &str) -> bool {
+    request.explicit_completion_after_interruption && request.actor_conversation_id != target_conversation_id
+}
+
+/// Remembers the turn whose choice notice was suppressed so it can be released on
+/// every exit path of the dispatch task.
+#[derive(Clone, Default)]
+pub(crate) struct SuppressedChoiceNoticeTurn(Arc<Mutex<Option<String>>>);
+
+impl SuppressedChoiceNoticeTurn {
+    pub(crate) fn suppress(&self, turn_id: &str) {
+        suppress_user_choice_notice_for_turn(turn_id);
+        let previous = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .replace(turn_id.to_owned());
+        if let Some(previous) = previous.filter(|previous| previous != turn_id) {
+            release_user_choice_notice_for_turn(&previous);
+        }
+    }
+
+    pub(crate) fn release(&self) {
+        let turn_id = self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).take();
+        if let Some(turn_id) = turn_id {
+            release_user_choice_notice_for_turn(&turn_id);
+        }
+    }
+}
+
 fn external_dispatch_waits_for_follow_up(outcome: &ConversationAgentTurnOutcome) -> bool {
     outcome.interrupted || outcome.resume_required
 }
@@ -910,6 +950,35 @@ mod tests {
             workspace_lease: None,
             explicit_completion_after_interruption: false,
         }
+    }
+
+    #[test]
+    fn choice_notice_is_suppressed_only_for_child_delegation_turns() {
+        // Child delegation (new or resumed child, recovery redispatch).
+        let mut delegation = request(ExternalConversationDispatchStrategy::Resume);
+        delegation.explicit_completion_after_interruption = true;
+        assert!(suppresses_user_choice_notice(&delegation, "target-1"));
+        assert!(suppresses_user_choice_notice(&delegation, "created-child"));
+
+        // Parent wake, integration/recovery wake: the parent resumes itself.
+        let mut parent_wake = request(ExternalConversationDispatchStrategy::Resume);
+        parent_wake.target_conversation_id = Some("actor-1".to_owned());
+        parent_wake.history_message_id = Some("report-message".to_owned());
+        assert!(!suppresses_user_choice_notice(&parent_wake, "actor-1"));
+
+        // Dooray response resume: actor and target are the same conversation.
+        let mut dooray_resume = request(ExternalConversationDispatchStrategy::Resume);
+        dooray_resume.target_conversation_id = Some("actor-1".to_owned());
+        assert!(!suppresses_user_choice_notice(&dooray_resume, "actor-1"));
+
+        // Group document instruction: another conversation without explicit completion.
+        let group_instruction = request(ExternalConversationDispatchStrategy::Resume);
+        assert!(!suppresses_user_choice_notice(&group_instruction, "target-1"));
+
+        // A self-targeted request stays user-facing even if it asks for explicit completion.
+        let mut self_delegation = delegation.clone();
+        self_delegation.target_conversation_id = Some("actor-1".to_owned());
+        assert!(!suppresses_user_choice_notice(&self_delegation, "actor-1"));
     }
 
     fn stored_dispatch_for_completion() -> StoredDispatch {

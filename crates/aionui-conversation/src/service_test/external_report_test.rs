@@ -261,9 +261,15 @@ impl IAgentTask for PromptCaptureAgent {
 
 impl IMockAgent for PromptCaptureAgent {}
 
-#[tokio::test]
-async fn external_dispatch_turn_omits_choice_notice_but_user_turn_keeps_it() {
-    const NOTICE_HEADER: &str = "[AionUi choice notifications]";
+const CHOICE_NOTICE_HEADER: &str = "[AionUi choice notifications]";
+
+/// Dispatches one MindNProgress-shaped request into a capture agent, then runs a
+/// plain user turn in the same target conversation, and returns both prompts.
+async fn dispatch_then_user_turn(
+    operation_id: &str,
+    actor_is_target: bool,
+    body: serde_json::Value,
+) -> (String, Vec<String>) {
     let db = init_database_memory().await.unwrap();
     seed_test_user(db.pool(), "user_1").await;
     let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
@@ -271,6 +277,11 @@ async fn external_dispatch_turn_omits_choice_notice_but_user_turn_keeps_it() {
     let tasks = Arc::new(MockTaskManager::new());
     let svc = service(repo.clone(), events.clone(), tasks.clone());
     let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let actor_id = if actor_is_target {
+        conv.id.clone()
+    } else {
+        svc.create("user_1", make_create_req()).await.unwrap().id
+    };
     let (event_tx, _) = broadcast::channel(16);
     let capture = Arc::new(PromptCaptureAgent {
         conversation_id: conv.id.clone(),
@@ -286,22 +297,22 @@ async fn external_dispatch_turn_omits_choice_notice_but_user_turn_keeps_it() {
             db.pool().clone(),
         )),
     );
-    let instruction = "# MindNProgress 하위 카드 위임 작업 요청\n위임 범위를 수행하고 결과를 보고한다.";
-    let request: aionui_api_types::ExternalConversationDispatchRequest = serde_json::from_value(json!({
-        "operationId": "dispatch-without-choice-notice", "actorConversationId": conv.id,
+    let instruction = format!("# MindNProgress 외부 대화 요청 {operation_id}\n요청 범위를 수행한다.");
+    let mut payload = json!({
+        "operationId": operation_id, "actorConversationId": actor_id,
         "targetConversationId": conv.id, "strategy": "resume", "instruction": instruction,
-    }))
-    .unwrap();
+    });
+    payload
+        .as_object_mut()
+        .unwrap()
+        .extend(body.as_object().unwrap().clone());
+    let request: aionui_api_types::ExternalConversationDispatchRequest = serde_json::from_value(payload).unwrap();
     dispatcher.dispatch(request).await.unwrap();
-    let mut finished = false;
+    let mut dispatched_turn_id = None;
     for _ in 0..100 {
-        let state = dispatcher
-            .status("dispatch-without-choice-notice")
-            .await
-            .unwrap()
-            .unwrap();
+        let state = dispatcher.status(operation_id).await.unwrap().unwrap();
         if state.state == aionui_api_types::ExternalConversationDispatchState::Completed {
-            finished = true;
+            dispatched_turn_id = state.turn_id;
             break;
         }
         assert_ne!(
@@ -311,7 +322,7 @@ async fn external_dispatch_turn_omits_choice_notice_but_user_turn_keeps_it() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert!(finished, "capture agent should finish the dispatched turn");
+    let dispatched_turn_id = dispatched_turn_id.expect("capture agent should finish the dispatched turn");
 
     svc.run_agent_turn(ConversationAgentTurnRequest {
         user_id: "user_1".into(),
@@ -327,11 +338,93 @@ async fn external_dispatch_turn_omits_choice_notice_but_user_turn_keeps_it() {
     })
     .await
     .unwrap();
+    // A finished dispatch must have released its turn from suppression.
+    AgentInstance::Mock(capture.clone())
+        .send_message(SendMessageData {
+            content: "같은 턴 재전송".into(),
+            msg_id: "message-after-dispatch".into(),
+            turn_id: Some(dispatched_turn_id),
+            files: vec![],
+            inject_skills: vec![],
+        })
+        .await
+        .unwrap();
 
     let sent = capture.sent.lock().unwrap().clone();
-    assert_eq!(sent.len(), 2, "{sent:?}");
-    assert_eq!(sent[0], instruction);
-    assert!(!sent[0].contains(NOTICE_HEADER));
+    assert_eq!(sent.len(), 3, "{sent:?}");
     assert!(sent[1].starts_with("일반 요청"));
-    assert!(sent[1].contains(NOTICE_HEADER));
+    assert!(sent[1].contains(CHOICE_NOTICE_HEADER));
+    assert!(sent[2].starts_with("같은 턴 재전송"));
+    assert!(sent[2].contains(CHOICE_NOTICE_HEADER));
+    (instruction, sent)
+}
+
+#[tokio::test]
+async fn external_child_delegation_turn_omits_choice_notice_but_user_turn_keeps_it() {
+    // MindNProgress child delegation: actor is the parent, explicit completion is requested.
+    let (instruction, sent) = dispatch_then_user_turn(
+        "dispatch-child-delegation",
+        false,
+        json!({ "explicitCompletionAfterInterruption": true }),
+    )
+    .await;
+    assert_eq!(sent[0], instruction);
+    assert!(!sent[0].contains(CHOICE_NOTICE_HEADER));
+}
+
+#[tokio::test]
+async fn external_user_facing_dispatches_keep_choice_notice() {
+    // Parent wake and integration/recovery wakes: the actor resumes itself.
+    let (instruction, sent) = dispatch_then_user_turn("dispatch-parent-wake", true, json!({})).await;
+    assert!(sent[0].starts_with(&instruction));
+    assert!(sent[0].contains(CHOICE_NOTICE_HEADER));
+
+    // Dooray response resume: the actor resumes itself without explicit completion.
+    let (instruction, sent) = dispatch_then_user_turn(
+        "dispatch-dooray-resume",
+        true,
+        json!({ "explicitCompletionAfterInterruption": false }),
+    )
+    .await;
+    assert!(sent[0].starts_with(&instruction));
+    assert!(sent[0].contains(CHOICE_NOTICE_HEADER));
+
+    // Group document instruction: another conversation, but no explicit completion.
+    let (instruction, sent) = dispatch_then_user_turn("gdi:dispatch-group-instruction", false, json!({})).await;
+    assert!(sent[0].starts_with(&instruction));
+    assert!(sent[0].contains(CHOICE_NOTICE_HEADER));
+}
+
+#[tokio::test]
+async fn suppressed_choice_notice_turn_is_released_without_a_turn_outcome() {
+    // The dispatch task releases through this handle on both Ok and Err outcomes.
+    const TURN_ID: &str = "turn-dispatch-released-on-error";
+    let (event_tx, _) = broadcast::channel(16);
+    let capture = Arc::new(PromptCaptureAgent {
+        conversation_id: "choice-release".into(),
+        workspace: ensure_test_workspace_path(),
+        event_tx,
+        sent: Default::default(),
+    });
+    let agent = AgentInstance::Mock(capture.clone());
+    let message = |content: &str| SendMessageData {
+        content: content.into(),
+        msg_id: "message-1".into(),
+        turn_id: Some(TURN_ID.into()),
+        files: vec![],
+        inject_skills: vec![],
+    };
+
+    let suppressed = crate::external_dispatch::SuppressedChoiceNoticeTurn::default();
+    suppressed.suppress(TURN_ID);
+    agent.send_message(message("위임 전문")).await.unwrap();
+    suppressed.release();
+    agent.send_message(message("재시도 요청")).await.unwrap();
+    // A second release is a no-op.
+    suppressed.release();
+
+    let sent = capture.sent.lock().unwrap().clone();
+    assert_eq!(sent[0], "위임 전문");
+    assert!(sent[1].starts_with("재시도 요청"));
+    assert!(sent[1].contains(CHOICE_NOTICE_HEADER));
 }
