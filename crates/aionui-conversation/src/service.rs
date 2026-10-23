@@ -3559,9 +3559,9 @@ impl ConversationService {
             });
         }
         let preview = normalize_choice_notice_preview(input.preview);
-        if preview.is_empty() || preview.chars().count() > MAX_CHOICE_NOTICE_PREVIEW_LENGTH {
+        if preview.chars().count() > MAX_CHOICE_NOTICE_PREVIEW_LENGTH {
             return Err(ConversationError::BadRequest {
-                reason: "choice notification preview must contain 1 to 320 characters".into(),
+                reason: "choice notification preview must contain at most 320 characters".into(),
             });
         }
         self.conversation_repo

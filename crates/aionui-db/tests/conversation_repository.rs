@@ -1560,6 +1560,27 @@ async fn choice_notices_are_user_scoped_and_keep_only_the_newest_identical_quest
 }
 
 #[tokio::test]
+async fn empty_choice_notices_remain_independent_and_dismissal_survives_replay() {
+    let (repo, _db) = setup().await;
+    let conv = make_conversation("empty-questions");
+    repo.create(&conv).await.unwrap();
+    let first = make_choice_notice(USER_ID, &conv.id, "message-a", "", 100);
+    let second = make_choice_notice(USER_ID, &conv.id, "message-b", "", 200);
+    let mut sibling = first.clone();
+    sibling.marker_index = 1;
+    sibling.key = serde_json::to_string(&(&conv.id, "message-a", 1)).unwrap();
+    for notice in [&first, &second, &sibling, &first] {
+        repo.upsert_choice_notice(notice).await.unwrap();
+    }
+    assert_eq!(repo.list_choice_notices(USER_ID).await.unwrap().len(), 3);
+    assert!(repo.dismiss_choice_notice(&first).await.unwrap());
+    repo.upsert_choice_notice(&first).await.unwrap();
+    let pending = repo.list_choice_notices(USER_ID).await.unwrap();
+    assert_eq!(pending.len(), 2);
+    assert!(pending.iter().all(|notice| notice.key != first.key));
+}
+
+#[tokio::test]
 async fn choice_notices_registered_after_a_user_message_remain_until_explicitly_dismissed() {
     let (repo, _db) = setup().await;
     let conv = make_conversation("choice-lifecycle");

@@ -813,7 +813,7 @@ impl IConversationRepository for SqliteConversationRepository {
 
         let newest_duplicate = sqlx::query_as::<_, ChoiceNoticeRow>(
             "SELECT * FROM choice_notifications \
-             WHERE user_id = ? AND conversation_id = ? AND status = 'pending' AND preview = ? \
+             WHERE user_id = ? AND conversation_id = ? AND status = 'pending' AND preview = ? AND preview != '' \
                AND message_id != ? AND key != ? \
              ORDER BY created_at DESC, message_id DESC, marker_index DESC \
              LIMIT 1",
@@ -857,7 +857,7 @@ impl IConversationRepository for SqliteConversationRepository {
 
         sqlx::query(
             "UPDATE choice_notifications SET status = 'superseded', updated_at = ? \
-             WHERE user_id = ? AND conversation_id = ? AND status = 'pending' AND preview = ? \
+             WHERE user_id = ? AND conversation_id = ? AND status = 'pending' AND preview = ? AND preview != '' \
                AND message_id != ? AND key != ?",
         )
         .bind(notice.updated_at)

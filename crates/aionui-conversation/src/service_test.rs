@@ -469,6 +469,7 @@ impl IConversationRepository for MockRepo {
             row.user_id == notice.user_id
                 && row.conversation_id == notice.conversation_id
                 && row.preview == notice.preview
+                && !notice.preview.is_empty()
                 && row.message_id != notice.message_id
                 && row.key != notice.key
                 && row.status == "pending"
@@ -6624,13 +6625,15 @@ async fn registering_choice_notice_rejects_invalid_or_foreign_input() {
                 conversation_id: conv.id.clone(),
                 message_id: "assistant-message".into(),
                 marker_index: 0,
-                preview: "   ".into(),
+                preview: "x".repeat(321),
                 created_at: 1,
             },
         )
         .await
         .unwrap_err();
-    assert!(matches!(invalid, ConversationError::BadRequest { .. }));
+    assert!(
+        matches!(invalid, ConversationError::BadRequest { reason } if reason == "choice notification preview must contain at most 320 characters")
+    );
 
     let foreign = svc
         .register_choice_notice(
@@ -6646,6 +6649,36 @@ async fn registering_choice_notice_rejects_invalid_or_foreign_input() {
         .await
         .unwrap_err();
     assert!(matches!(foreign, ConversationError::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn empty_choice_notice_can_be_registered_and_dismissed_without_reviving_on_replay() {
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let request = RegisterChoiceNoticeRequest {
+        conversation_id: conv.id,
+        message_id: "empty-question".into(),
+        marker_index: 0,
+        preview: "   ".into(),
+        created_at: 1,
+    };
+    let pending = svc.register_choice_notice("user_1", request.clone()).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].preview.is_empty());
+    svc.dismiss_choice_notice(
+        "user_1",
+        DismissChoiceNoticeRequest {
+            conversation_id: request.conversation_id.clone(),
+            message_id: request.message_id.clone(),
+            marker_index: request.marker_index,
+            preview: String::new(),
+            created_at: request.created_at,
+        },
+    )
+    .await
+    .unwrap();
+    let replay = svc.register_choice_notice("user_1", request).await.unwrap();
+    assert!(replay.is_empty());
 }
 
 #[tokio::test]
