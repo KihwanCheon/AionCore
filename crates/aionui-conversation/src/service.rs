@@ -1,6 +1,7 @@
 mod external_report;
 mod mcp_reload;
 pub mod native_history;
+pub(crate) mod native_questions;
 mod turn_observation;
 mod workspace_rebind;
 
@@ -3803,7 +3804,29 @@ impl ConversationService {
             .find(|c| c.call_id == request_id)
             .map(|c| c.id.clone());
 
+        let answer_content = answers.as_ref().map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    serde_json::json!({
+                        "question": item.question, "labels": item.labels,
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
         agent.answer_ask(request_id, answers)?;
+        if let Err(error) = native_questions::record_native_question_answer(
+            self.conversation_repo.as_ref(),
+            self.broadcaster.as_ref(),
+            user_id,
+            conversation_id,
+            request_id,
+            answer_content,
+        )
+        .await
+        {
+            warn!(conversation_id, request_id, error = %ErrorChain(&error), "Failed to persist accepted question response");
+        }
 
         if let Some(conf_id) = conf_id {
             let payload = serde_json::json!({

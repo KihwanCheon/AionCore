@@ -187,6 +187,7 @@ pub enum MessageType {
     ToolGroup,
     AgentStatus,
     Permission,
+    Ask,
     AcpToolCall,
     Plan,
     Thinking,

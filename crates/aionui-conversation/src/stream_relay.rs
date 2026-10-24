@@ -452,7 +452,8 @@ impl StreamRelay {
                         }
                         AgentStreamEvent::UserQuestion(data) => {
                             self.complete_active_thinking(&mut active_thinking).await;
-                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish").await;
+                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                                .await;
                             // Keep these anchors outside terminal prose rewrites and later replies.
                             let persisted = self.persist_user_questions(data).await;
                             attempt.saw_visible_output |= persisted;
@@ -664,13 +665,21 @@ impl StreamRelay {
                                 self.adapter.persist_tip(annotated.as_ref().unwrap_or(data)).await;
                             }
                         }
+                        AgentStreamEvent::Ask(data) => {
+                            self.complete_active_thinking(&mut active_thinking).await;
+                            self.close_active_text_segment(&mut active_text, &mut text_segments, "finish")
+                                .await;
+                            attempt.saw_tool_or_side_effect = true;
+                            if self.persist_native_question(data).await {
+                                attempt.saw_visible_output = true;
+                                attempt.persisted_assistant_output = true;
+                            } else {
+                                self.forward_to_websocket(&event);
+                            }
+                        }
                         AgentStreamEvent::CronTrigger(_)
                         | AgentStreamEvent::Permission(_)
-                        | AgentStreamEvent::AcpPermission(_)
-                        // Ask rides the permission lane: a raised question is a
-                        // side-effect (blocks auto-replay) and must reach the ws
-                        // live for the card to pop mid-turn.
-                        | AgentStreamEvent::Ask(_) => {
+                        | AgentStreamEvent::AcpPermission(_) => {
                             attempt.saw_tool_or_side_effect = true;
                             self.forward_to_websocket(&event);
                         }

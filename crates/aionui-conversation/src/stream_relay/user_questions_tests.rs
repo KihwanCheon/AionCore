@@ -221,3 +221,156 @@ async fn async_question_empty_payload_does_not_create_a_notice() {
     assert!(rig.messages().await.is_empty());
     assert!(rig.repo.list_choice_notices(&rig.user_id).await.unwrap().is_empty());
 }
+
+fn native_question() -> serde_json::Value {
+    json!({
+        "session_id": "conv-q", "request_id": "native-request",
+        "questions": [
+            {"question": "배포 범위를 선택해 주세요.", "header": "배포", "multiSelect": false,
+             "options": [{"label": "검증 환경", "description": "사전 검증"}, {"label": "운영 환경"}]},
+            {"question": "대상 기능을 선택해 주세요.", "multiSelect": true,
+             "options": [{"label": "질문 알림"}, {"label": "질문 이동"}]}
+        ]
+    })
+}
+
+#[tokio::test]
+async fn native_question_persists_interactive_anchor_before_each_notice_without_a_renderer() {
+    let rig = Rig::new().await;
+    let mut ws = rig.bus.subscribe();
+    let (tx, rx) = broadcast::channel(8);
+    tx.send(AgentStreamEvent::Ask(native_question())).unwrap();
+    tx.send(AgentStreamEvent::Text(TextEventData {
+        content: "다음 설명".into(),
+    }))
+    .unwrap();
+    tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
+    rig.relay(&rig.user_id).consume(rx).await;
+    let rows = rig.messages().await;
+    let notices = rig.repo.list_choice_notices(&rig.user_id).await.unwrap();
+    assert_eq!(notices.len(), 2);
+    let anchor = rows.iter().find(|row| row.r#type == "ask").unwrap();
+    assert_eq!(rows.len(), 2, "interactive question must not merge into terminal prose");
+    let response = crate::convert::row_to_message_response(anchor.clone()).unwrap();
+    assert_eq!(response.r#type, aionui_common::MessageType::Ask);
+    assert_eq!(response.content["questions"], native_question()["questions"]);
+    assert_eq!(response.content["persisted"], true);
+    assert!(notices.iter().all(|notice| notice.message_id == anchor.id));
+    assert_eq!(
+        notices.iter().map(|notice| notice.marker_index).collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let mut anchors = 0;
+    while let Ok(event) = ws.try_recv() {
+        assert_eq!(event.data["user_id"], rig.user_id);
+        if event.name == "message.stream" && event.data["type"] == "ask" {
+            anchors += 1;
+            assert_eq!(event.data["msg_id"], anchor.id);
+        }
+        if event.name == "conversation.choiceNoticesChanged" {
+            assert_eq!(anchors, 1, "a notice must point at an already queryable card");
+        }
+    }
+    assert_eq!(anchors, 1, "do not also forward a second transient question card");
+}
+
+#[tokio::test]
+async fn native_question_replay_preserves_dismissal_and_answered_or_declined_card() {
+    use crate::service::native_questions::record_native_question_answer;
+    for answers in [
+        Some(vec![
+            json!({"question": "배포 범위를 선택해 주세요.", "labels": ["검증 환경"]}),
+        ]),
+        None,
+    ] {
+        let rig = Rig::new().await;
+        assert!(
+            rig.relay(&rig.user_id)
+                .persist_native_question(&native_question())
+                .await
+        );
+        let before = rig.repo.list_choice_notices(&rig.user_id).await.unwrap();
+        rig.repo.dismiss_choice_notice(&before[0]).await.unwrap();
+        let resolution = if answers.is_some() { "answered" } else { "declined" };
+        record_native_question_answer(
+            rig.repo.as_ref(),
+            rig.bus.as_ref(),
+            &rig.user_id,
+            "conv-q",
+            "native-request",
+            answers.clone(),
+        )
+        .await
+        .unwrap();
+        assert!(
+            rig.relay(&rig.user_id)
+                .persist_native_question(&native_question())
+                .await
+        );
+        let rows = rig.messages().await;
+        assert_eq!(rows.len(), 1, "reopening and replay must retain one card");
+        let content: serde_json::Value = serde_json::from_str(&rows[0].content).unwrap();
+        assert_eq!(content["resolution"], resolution);
+        if let Some(answers) = answers {
+            assert_eq!(content["answers"], json!(answers));
+        }
+        let pending = rig.repo.list_choice_notices(&rig.user_id).await.unwrap();
+        assert_eq!(pending.len(), 1, "answering must not dismiss the independent notice");
+        assert_eq!(pending[0].key, before[1].key);
+    }
+}
+
+#[tokio::test]
+async fn native_question_rejects_malformed_or_cross_conversation_metadata() {
+    let rig = Rig::new().await;
+    for payload in [
+        json!({}),
+        json!({"request_id": "", "questions": []}),
+        json!({"request_id": "req", "questions": [{"question": " ", "options": []}]}),
+        json!({"request_id": "req", "questions": [{"question": "질문", "options": ["잘못된 선택지"]}]}),
+        json!({"session_id": "other-conversation", "request_id": "req", "questions": native_question()["questions"]}),
+    ] {
+        assert!(!rig.relay(&rig.user_id).persist_native_question(&payload).await);
+    }
+    assert!(rig.messages().await.is_empty());
+    assert!(rig.repo.list_choice_notices(&rig.user_id).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn native_question_cross_user_cannot_create_or_resolve_another_users_card() {
+    use crate::service::native_questions::record_native_question_answer;
+    let rig = Rig::new().await;
+    let mut ws = rig.bus.subscribe();
+    assert!(
+        !rig.relay(&rig.other_user_id)
+            .persist_native_question(&native_question())
+            .await
+    );
+    assert!(rig.messages().await.is_empty());
+    assert!(matches!(ws.try_recv(), Err(broadcast::error::TryRecvError::Empty)));
+    assert!(
+        rig.relay(&rig.user_id)
+            .persist_native_question(&native_question())
+            .await
+    );
+    record_native_question_answer(
+        rig.repo.as_ref(),
+        rig.bus.as_ref(),
+        &rig.other_user_id,
+        "conv-q",
+        "native-request",
+        None,
+    )
+    .await
+    .unwrap();
+    let rows = rig.messages().await;
+    let content: serde_json::Value = serde_json::from_str(&rows[0].content).unwrap();
+    assert!(content.get("resolution").is_none());
+    assert!(
+        rig.repo
+            .list_choice_notices(&rig.other_user_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
