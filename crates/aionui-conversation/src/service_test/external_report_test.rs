@@ -26,6 +26,144 @@ fn service(
 }
 
 #[tokio::test]
+async fn archived_conversation_rejects_all_incoming_and_runtime_entry_points() {
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let repo = Arc::new(SqliteConversationRepository::new(db.pool().clone()));
+    let events = Arc::new(MockBroadcaster::new());
+    let tasks = Arc::new(MockTaskManager::new());
+    let svc = service(repo.clone(), events.clone(), tasks.clone());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let before = svc.append_external_report("user_1", &conv.id, report()).await.unwrap();
+    sqlx::query("UPDATE conversations SET archived_at = 1 WHERE id = ?")
+        .bind(&conv.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    events.take_events();
+    let manager: Arc<dyn IWorkerTaskManager> = tasks.clone();
+    let request = serde_json::from_value(json!({"content": "ordinary input", "files": []})).unwrap();
+    assert!(matches!(
+        svc.send_message("user_1", &conv.id, request, &manager).await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(matches!(
+        svc.append_external_report("user_1", &conv.id, report()).await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(matches!(
+        svc.warmup("user_1", &conv.id, &manager).await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(matches!(
+        svc.ensure_runtime("user_1", &conv.id, &manager).await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(matches!(
+        svc.restart_runtime("user_1", &conv.id, &manager).await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(matches!(
+        svc.answer_ask("user_1", &conv.id, "ask", None, &manager).await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(matches!(
+        svc.confirm(
+            "user_1",
+            &conv.id,
+            "call",
+            aionui_api_types::ConfirmRequest {
+                msg_id: "message".into(),
+                data: json!({"allow": true}),
+                always_allow: false,
+            },
+            &manager
+        )
+        .await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(matches!(
+        svc.handle_side_question(
+            "user_1",
+            &conv.id,
+            aionui_api_types::SideQuestionRequest {
+                question: "side question".into(),
+            }
+        )
+        .await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(matches!(
+        svc.set_config_option(
+            "user_1",
+            &conv.id,
+            "mode",
+            aionui_api_types::SetConfigOptionRequest { value: "auto".into() }
+        )
+        .await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(matches!(
+        svc.run_agent_turn(ConversationAgentTurnRequest {
+            user_id: "user_1".into(),
+            conversation_id: conv.id.clone(),
+            content: "cron input".into(),
+            files: vec![],
+            inject_skills: vec![],
+            required_runtime_mode: None,
+            persist_user_message: true,
+            user_message_hidden: true,
+            on_started: None,
+            on_resource_waiting: None,
+        })
+        .await,
+        Err(ConversationError::Archived { .. })
+    ));
+    assert!(
+        events.take_events().is_empty(),
+        "rejected sends must not announce successful delivery"
+    );
+    assert_eq!(tasks.active_count(), 0);
+    assert!(
+        repo.get_message("user_1", &conv.id, &before.message_id)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    let dispatcher = crate::external_dispatch::ExternalConversationDispatchService::new(
+        svc.clone(),
+        Arc::new(aionui_db::fork_extensions::SqliteExternalDispatchRepository::new(
+            db.pool().clone(),
+        )),
+    );
+    let request = serde_json::from_value(json!({
+        "operationId": "archived-wake", "actorConversationId": conv.id,
+        "targetConversationId": conv.id, "strategy": "resume", "instruction": report().content,
+        "historyMessageId": before.message_id,
+    }))
+    .unwrap();
+    assert!(matches!(
+        dispatcher.dispatch(request).await,
+        Err(
+            crate::external_dispatch::ExternalConversationDispatchError::Conversation(
+                ConversationError::Archived { .. }
+            )
+        )
+    ));
+    sqlx::query("UPDATE conversations SET archived_at = NULL WHERE id = ?")
+        .bind(&conv.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    assert!(
+        svc.append_external_report("user_1", &conv.id, report())
+            .await
+            .unwrap()
+            .repeated
+    );
+}
+
+#[tokio::test]
 async fn external_report_is_visible_once_while_busy_and_survives_service_restart() {
     let db = init_database_memory().await.unwrap();
     seed_test_user(db.pool(), "user_1").await;

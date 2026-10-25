@@ -21,6 +21,12 @@ pub trait IConversationRepository: Send + Sync {
     /// Returns a conversation by user and ID, or `None` if not found.
     async fn get(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError>;
 
+    /// Load a conversation for incoming work. Archive-capable stores must reject
+    /// archived rows; history reads continue to use `get`.
+    async fn get_active(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {
+        self.get(user_id, id).await
+    }
+
     /// Returns the owner user ID for a conversation, or `None` if the conversation does not exist.
     async fn owner_user_id(&self, id: &str) -> Result<Option<String>, DbError>;
 

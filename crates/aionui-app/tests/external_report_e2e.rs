@@ -7,6 +7,65 @@ use serde_json::json;
 use tower::ServiceExt;
 
 #[tokio::test]
+async fn archived_http_target_rejects_messages_and_reports_without_starting_runtime() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let created = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            "/api/conversations",
+            json!({"type": "acp", "name": "Archived target", "extra": {}}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    let id = body_json(created).await["data"]["id"].as_str().unwrap().to_owned();
+    let archived = app
+        .clone()
+        .oneshot(json_with_token(
+            "POST",
+            &format!("/api/sidebar/conversation/{id}/archive"),
+            json!({}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(archived.status(), StatusCode::OK);
+    for (suffix, payload) in [
+        ("messages", json!({"content": "rejected input", "files": []})),
+        (
+            "external-reports",
+            json!({"operationId": "archived-report", "content": "rejected report"}),
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(json_with_token(
+                "POST",
+                &format!("/api/conversations/{id}/{suffix}"),
+                payload,
+                &token,
+                &csrf,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::GONE, "{suffix}");
+        let body = body_json(response).await;
+        assert_eq!(body["code"], "CONVERSATION_ARCHIVED", "{body}");
+    }
+    assert!(services.worker_task_manager.get_task(&id).is_none());
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+        .bind(&id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+}
+
+#[tokio::test]
 async fn external_report_http_contract_and_security() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

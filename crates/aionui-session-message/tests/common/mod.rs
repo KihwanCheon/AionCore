@@ -234,6 +234,7 @@ impl IWorkerTaskManager for StubTaskManager {
 // ── Harness ─────────────────────────────────────────────────────────
 
 pub struct Ctx {
+    pub pool: sqlx::SqlitePool,
     pub service: Arc<SessionMessageService>,
     pub targets: Arc<MentionableTargets>,
     pub conversation_service: ConversationService,
@@ -309,6 +310,7 @@ pub async fn setup_with_clock(clock: Arc<TestClock>) -> Ctx {
     ));
 
     Ctx {
+        pool,
         service,
         targets: Arc::new(MentionableTargets::new(conversation_repo.clone(), project_service)),
         conversation_service,

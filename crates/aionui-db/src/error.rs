@@ -10,6 +10,9 @@ pub enum DbError {
     #[error("Record not found: {0}")]
     NotFound(String),
 
+    #[error("Conversation is archived: {0}")]
+    Archived(String),
+
     #[error("Duplicate record: {0}")]
     Conflict(String),
 

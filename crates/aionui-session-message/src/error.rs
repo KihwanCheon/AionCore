@@ -10,6 +10,9 @@ pub enum SessionMessageError {
     #[error("target conversation not found: {id}")]
     TargetNotFound { id: String },
 
+    #[error("target conversation is archived; restore it before sending: {id}")]
+    TargetArchived { id: String },
+
     #[error("target conversation is team-owned: {id}")]
     TargetIsTeam { id: String },
 
@@ -39,6 +42,7 @@ impl SessionMessageError {
     pub fn code(&self) -> SessionToolErrorCode {
         match self {
             Self::TargetNotFound { .. } => SessionToolErrorCode::TargetNotFound,
+            Self::TargetArchived { .. } => SessionToolErrorCode::TargetArchived,
             Self::TargetIsTeam { .. } => SessionToolErrorCode::TargetIsTeam,
             Self::SenderIsTeam { .. } => SessionToolErrorCode::SenderIsTeam,
             Self::TargetIsSelf { .. } => SessionToolErrorCode::TargetIsSelf,
@@ -53,6 +57,7 @@ impl SessionMessageError {
     pub fn http_status(&self) -> u16 {
         match self {
             Self::TargetNotFound { .. } => 404,
+            Self::TargetArchived { .. } => 410,
             Self::TargetIsTeam { .. } | Self::SenderIsTeam { .. } | Self::FeatureDisabled => 403,
             Self::TargetIsSelf { .. } | Self::SchemaValidation { .. } => 400,
             Self::QueueFull | Self::TransportUnavailable { .. } => 409,
@@ -70,6 +75,11 @@ mod tests {
     #[test]
     fn every_error_maps_to_the_status_the_spec_pins() {
         let cases: &[(SessionMessageError, SessionToolErrorCode, u16)] = &[
+            (
+                SessionMessageError::TargetArchived { id: "c".into() },
+                SessionToolErrorCode::TargetArchived,
+                410,
+            ),
             (
                 SessionMessageError::TargetNotFound { id: "c".into() },
                 SessionToolErrorCode::TargetNotFound,

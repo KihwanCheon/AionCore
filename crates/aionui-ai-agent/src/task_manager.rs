@@ -96,6 +96,7 @@ pub struct WorkerTaskManagerImpl {
     factory: AgentFactory,
     active_leases: Arc<ActiveLeaseRegistry>,
     runtime_token_service: Option<Arc<RuntimeTokenService>>,
+    conversation_repo: Option<Arc<dyn aionui_db::IConversationRepository>>,
 }
 
 impl WorkerTaskManagerImpl {
@@ -109,12 +110,35 @@ impl WorkerTaskManagerImpl {
             factory,
             active_leases,
             runtime_token_service: None,
+            conversation_repo: None,
         }
     }
 
     pub fn with_runtime_token_service(mut self, runtime_token_service: Arc<RuntimeTokenService>) -> Self {
         self.runtime_token_service = Some(runtime_token_service);
         self
+    }
+
+    /// Enforce persisted archive state for all runtime entry points, including
+    /// queued turns and automatic recovery that outlive their original request.
+    pub fn with_conversation_repository(mut self, repo: Arc<dyn aionui_db::IConversationRepository>) -> Self {
+        self.conversation_repo = Some(repo);
+        self
+    }
+
+    async fn ensure_active_conversation(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
+        let Some(repo) = &self.conversation_repo else {
+            return Ok(());
+        };
+        match repo.get_active(user_id, id).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(AgentError::not_found(id)),
+            Err(aionui_db::DbError::Archived(_)) => {
+                info!(conversation_id = id, "Blocked agent startup for archived conversation");
+                Err(AgentError::conversation_archived(id))
+            }
+            Err(error) => Err(AgentError::internal(error.to_string())),
+        }
     }
 
     /// Look up a fully-initialised instance by conversation id.
@@ -198,8 +222,13 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
         // failure the cell stays empty so a later caller can retry.
         let factory = self.factory.clone();
         let runtime_capabilities = options.runtime_capabilities.clone();
+        let user_id = options.context.conversation.user_id.clone();
+        let build_user_id = user_id.clone();
         let managed = slot
             .get_or_try_init(|| async move {
+                // Inside the slot initializer: archive teardown waits for this
+                // same initializer, so it cannot miss a build already admitted.
+                self.ensure_active_conversation(&build_user_id, conversation_id).await?;
                 let agent = factory(options).await?;
                 Ok::<ManagedAgentTask, AgentError>(ManagedAgentTask {
                     agent,
@@ -207,6 +236,15 @@ impl IWorkerTaskManager for WorkerTaskManagerImpl {
                 })
             })
             .await?;
+        self.ensure_active_conversation(&user_id, conversation_id).await?;
+        if self.conversation_repo.is_some()
+            && !self
+                .tasks
+                .get(conversation_id)
+                .is_some_and(|current| Arc::ptr_eq(&current, &slot))
+        {
+            return Err(AgentError::conflict("Agent task was removed during startup"));
+        }
         Ok(managed.agent.clone())
     }
 
@@ -557,6 +595,108 @@ mod tests {
             async move { Ok(mock_instance(MockAgent::new(opts.conversation_id(), None))) }.boxed()
         });
         WorkerTaskManagerImpl::new(factory)
+    }
+
+    async fn archive_test_database() -> aionui_db::Database {
+        let db = aionui_db::init_database_memory().await.unwrap();
+        sqlx::query("INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at) VALUES ('conv-archive', 'system_default_user', 'Archive', 'acp', '{}', 1, 1)")
+            .execute(db.pool()).await.unwrap();
+        db
+    }
+
+    fn archive_test_options() -> BuildTaskOptions {
+        let mut options = make_options("conv-archive");
+        options.context.conversation.user_id = "system_default_user".into();
+        options
+    }
+
+    #[tokio::test]
+    async fn archived_runtime_cannot_be_created_or_reused_until_restored() {
+        let db = archive_test_database().await;
+        let manager = make_manager().with_conversation_repository(Arc::new(
+            aionui_db::SqliteConversationRepository::new(db.pool().clone()),
+        ));
+        manager
+            .get_or_build_task("conv-archive", archive_test_options())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE conversations SET archived_at = 1 WHERE id = 'conv-archive'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_or_build_task("conv-archive", archive_test_options()).await,
+            Err(AgentError::ConversationArchived(_))
+        ));
+        manager
+            .kill_and_wait("conv-archive", Some(AgentKillReason::Archived))
+            .await;
+        assert!(matches!(
+            manager.get_or_build_task("conv-archive", archive_test_options()).await,
+            Err(AgentError::ConversationArchived(_))
+        ));
+        assert!(manager.get_task("conv-archive").is_none());
+        sqlx::query("UPDATE conversations SET archived_at = NULL WHERE id = 'conv-archive'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .get_or_build_task("conv-archive", archive_test_options())
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn archived_inflight_build_is_stopped_and_a_late_start_cannot_revive_it() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let db = archive_test_database().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let killed = Arc::new(AtomicUsize::new(0));
+        let builds = Arc::new(AtomicUsize::new(0));
+        let factory: AgentFactory = Arc::new({
+            let (started, release, killed, builds) = (started.clone(), release.clone(), killed.clone(), builds.clone());
+            move |opts| {
+                let (started, release, killed, builds) =
+                    (started.clone(), release.clone(), killed.clone(), builds.clone());
+                async move {
+                    builds.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    release.notified().await;
+                    Ok(mock_instance(
+                        MockAgent::new(opts.conversation_id(), None).with_kill_counter(killed),
+                    ))
+                }
+                .boxed()
+            }
+        });
+        let manager = Arc::new(
+            WorkerTaskManagerImpl::new(factory).with_conversation_repository(Arc::new(
+                aionui_db::SqliteConversationRepository::new(db.pool().clone()),
+            )),
+        );
+        let build = tokio::spawn({
+            let manager = manager.clone();
+            async move { manager.get_or_build_task("conv-archive", archive_test_options()).await }
+        });
+        started.notified().await;
+        sqlx::query("UPDATE conversations SET archived_at = 1 WHERE id = 'conv-archive'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let stop = tokio::spawn(manager.kill_and_wait("conv-archive", Some(AgentKillReason::Archived)));
+        assert!(matches!(
+            manager.get_or_build_task("conv-archive", archive_test_options()).await,
+            Err(AgentError::ConversationArchived(_))
+        ));
+        release.notify_one();
+        assert!(matches!(build.await.unwrap(), Err(AgentError::ConversationArchived(_))));
+        stop.await.unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(killed.load(Ordering::SeqCst), 1);
+        assert!(manager.get_task("conv-archive").is_none());
     }
 
     fn capture_logs(max_level: tracing::Level, f: impl FnOnce()) -> String {

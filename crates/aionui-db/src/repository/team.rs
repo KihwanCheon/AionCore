@@ -66,6 +66,11 @@ pub trait ITeamRepository: Send + Sync {
     /// Returns a single team for startup/session restore.
     async fn get_team_for_restore(&self, team_id: &str) -> Result<Option<TeamRow>, DbError>;
 
+    /// Runtime startup must reject archived teams, including cached sessions.
+    async fn get_active_team_for_runtime(&self, team_id: &str) -> Result<Option<TeamRow>, DbError> {
+        self.get_team_for_restore(team_id).await
+    }
+
     /// Updates a team by id with the provided fields.
     /// Returns `DbError::NotFound` if absent.
     async fn update_team(&self, user_id: &str, team_id: &str, params: &UpdateTeamParams) -> Result<(), DbError>;

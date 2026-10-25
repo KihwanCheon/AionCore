@@ -72,6 +72,7 @@ fn db_error_to_api_error(err: DbError) -> ApiError {
         DbError::Query(e) => ApiError::Internal(format!("Database error: {e}")),
         DbError::Migration(e) => ApiError::Internal(format!("Migration error: {e}")),
         DbError::Init(msg) => ApiError::Internal(format!("Database init error: {msg}")),
+        DbError::Archived(id) => ApiError::ConversationArchived(id),
     }
 }
 

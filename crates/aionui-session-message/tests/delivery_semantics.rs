@@ -16,6 +16,59 @@ fn request(to: &str, message: &str) -> SessionSendMessageRequest {
     }
 }
 
+#[tokio::test]
+async fn archived_target_is_rejected_before_midturn_delivery_and_never_queued() {
+    let ctx = setup().await;
+    let from = ctx.create_conversation("from", "Sender", "/w").await;
+    let to = ctx.create_conversation("to", "Target", "/w").await;
+    let (_claim, agent) = ctx.make_busy(&to.id, true);
+    sqlx::query("UPDATE conversations SET archived_at = 1 WHERE id = ?")
+        .bind(&to.id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    let error = ctx
+        .service
+        .send(USER, &from.id, &request(&to.id, "must not arrive"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), SessionToolErrorCode::TargetArchived);
+    assert_eq!(error.http_status(), 410);
+    assert!(ctx.queue.is_empty());
+    assert!(agent.delivered_midturn.lock().unwrap().is_empty());
+    assert!(ctx.broadcaster.find("message.userCreated").is_none());
+}
+
+#[tokio::test]
+async fn archived_target_drops_previously_queued_delivery_without_resurrecting_after_restore() {
+    let ctx = setup().await;
+    let from = ctx.create_conversation("from", "Sender", "/w").await;
+    let to = ctx.create_conversation("to", "Target", "/w").await;
+    let (claim, agent) = ctx.make_busy(&to.id, false);
+    let queued = ctx
+        .service
+        .send(USER, &from.id, &request(&to.id, "queued before archive"))
+        .await
+        .unwrap();
+    assert_eq!(queued.status, SessionDeliveryStatus::Queued);
+    sqlx::query("UPDATE conversations SET archived_at = 1 WHERE id = ?")
+        .bind(&to.id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    drop(claim);
+    ctx.drainer().tick_once().await;
+    assert!(ctx.queue.is_empty());
+    sqlx::query("UPDATE conversations SET archived_at = NULL WHERE id = ?")
+        .bind(&to.id)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+    ctx.drainer().tick_once().await;
+    assert!(agent.sent.lock().unwrap().is_empty());
+    assert!(ctx.broadcaster.find("message.userCreated").is_none());
+}
+
 // ── Validation order (spec §6.3) ────────────────────────────────────
 
 #[tokio::test]

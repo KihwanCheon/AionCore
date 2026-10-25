@@ -1408,7 +1408,7 @@ impl TeamSessionService {
             .clone();
         let membership_guard = membership_lock.lock().await;
 
-        let row = match self.repo.get_team_for_restore(team_id).await {
+        let row = match self.repo.get_active_team_for_runtime(team_id).await {
             Ok(Some(row)) => row,
             Ok(None) => {
                 if let Some(user_id) = requested_user_id {

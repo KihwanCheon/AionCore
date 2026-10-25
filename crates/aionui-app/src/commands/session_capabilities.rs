@@ -36,6 +36,7 @@ pub(crate) fn data() -> Value {
         "tools": tools,
         "errors": [
             "target_not_found",
+            "target_archived",
             "target_is_team",
             "sender_is_team",
             "target_is_self",
@@ -95,6 +96,7 @@ mod tests {
             .collect();
         for expected in [
             "target_not_found",
+            "target_archived",
             "target_is_team",
             "sender_is_team",
             "target_is_self",

@@ -135,6 +135,7 @@ pub fn tool_name_for_session_cli_path(path: &[String]) -> Option<SessionToolName
 #[serde(rename_all = "snake_case")]
 pub enum SessionToolErrorCode {
     TargetNotFound,
+    TargetArchived,
     TargetIsTeam,
     SenderIsTeam,
     TargetIsSelf,

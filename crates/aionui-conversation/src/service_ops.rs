@@ -465,9 +465,9 @@ impl ConversationService {
     async fn ensure_owned_conversation(&self, user_id: &str, conversation_id: &str) -> Result<(), ConversationError> {
         let exists = self
             .conversation_repo()
-            .get(user_id, conversation_id)
+            .get_active(user_id, conversation_id)
             .await
-            .map_err(|e| ConversationError::internal(format!("Failed to load conversation: {e}")))?
+            .map_err(ConversationError::from)?
             .is_some();
         if exists {
             Ok(())

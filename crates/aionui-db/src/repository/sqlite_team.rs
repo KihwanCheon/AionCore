@@ -1,5 +1,5 @@
 use aionui_common::now_ms;
-use sqlx::SqlitePool;
+use sqlx::{FromRow, Row, SqlitePool};
 
 use crate::error::DbError;
 use crate::models::{MailboxMessageRow, TeamRow, TeamTaskRow};
@@ -45,9 +45,10 @@ impl ITeamRepository for SqliteTeamRepository {
     }
 
     async fn list_teams_for_restore(&self) -> Result<Vec<TeamRow>, DbError> {
-        let rows = sqlx::query_as::<_, TeamRow>("SELECT * FROM teams ORDER BY created_at ASC")
-            .fetch_all(&self.pool)
-            .await?;
+        let rows =
+            sqlx::query_as::<_, TeamRow>("SELECT * FROM teams WHERE archived_at IS NULL ORDER BY created_at ASC")
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 
@@ -78,6 +79,20 @@ impl ITeamRepository for SqliteTeamRepository {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row)
+    }
+
+    async fn get_active_team_for_runtime(&self, team_id: &str) -> Result<Option<TeamRow>, DbError> {
+        let row = sqlx::query("SELECT * FROM teams WHERE id = ?")
+            .bind(team_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            if row.try_get::<Option<i64>, _>("archived_at")?.is_some() {
+                return Err(DbError::Archived(team_id.to_owned()));
+            }
+            Ok(TeamRow::from_row(&row)?)
+        })
+        .transpose()
     }
 
     async fn update_team(&self, user_id: &str, team_id: &str, params: &UpdateTeamParams) -> Result<(), DbError> {
@@ -166,7 +181,10 @@ impl ITeamRepository for SqliteTeamRepository {
             "INSERT INTO mailbox \
                 (id, team_id, to_agent_id, from_agent_id, type, content, summary, files, read, created_at) \
              SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? \
-             WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ?)",
+             WHERE EXISTS (SELECT 1 FROM teams t WHERE t.id = ? AND t.user_id = ? AND t.archived_at IS NULL \
+               AND NOT EXISTS (SELECT 1 FROM json_each(t.agents) a \
+                 JOIN conversations c ON c.id = json_extract(a.value, '$.conversation_id') AND c.user_id = t.user_id \
+                 WHERE json_extract(a.value, '$.slot_id') = ? AND c.archived_at IS NOT NULL))",
         )
         .bind(&row.id)
         .bind(&row.team_id)
@@ -180,6 +198,7 @@ impl ITeamRepository for SqliteTeamRepository {
         .bind(row.created_at)
         .bind(&row.team_id)
         .bind(user_id)
+        .bind(&row.to_agent_id)
         .execute(&self.pool)
         .await?;
         if result.rows_affected() == 0 {

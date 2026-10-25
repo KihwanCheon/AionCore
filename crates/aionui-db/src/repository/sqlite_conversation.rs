@@ -1,4 +1,4 @@
-use sqlx::{Row, SqlitePool};
+use sqlx::{FromRow, Row, SqlitePool};
 
 use aionui_common::{PaginatedResult, TimestampMs};
 
@@ -33,6 +33,26 @@ impl SqliteConversationRepository {
         Self { pool }
     }
 
+    // The writer lock makes archive and incoming-message persistence ordered:
+    // once archive commits, no later insert/upsert can accept work for the row.
+    async fn ensure_active_for_write(
+        connection: &mut sqlx::SqliteConnection,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), DbError> {
+        let archived: Option<Option<i64>> =
+            sqlx::query_scalar("SELECT archived_at FROM conversations WHERE user_id = ? AND id = ?")
+                .bind(user_id)
+                .bind(conversation_id)
+                .fetch_optional(connection)
+                .await?;
+        match archived {
+            Some(None) => Ok(()),
+            Some(Some(_)) => Err(DbError::Archived(conversation_id.to_owned())),
+            None => Err(DbError::NotFound(format!("Conversation '{conversation_id}' not found"))),
+        }
+    }
+
     async fn conversation_exists_for_user(&self, user_id: &str, conversation_id: &str) -> Result<bool, DbError> {
         let exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
             .bind(user_id)
@@ -61,18 +81,7 @@ impl SqliteConversationRepository {
         let result: Result<(), DbError> = async {
             // Ownership check inside the same transaction as the insert +
             // bump, so parent-chain authorization and the write are atomic.
-            let exists: i64 =
-                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM conversations WHERE user_id = ? AND id = ?)")
-                    .bind(user_id)
-                    .bind(&message.conversation_id)
-                    .fetch_one(&mut *transaction)
-                    .await?;
-            if exists == 0 {
-                return Err(DbError::NotFound(format!(
-                    "Conversation '{}' not found",
-                    message.conversation_id
-                )));
-            }
+            Self::ensure_active_for_write(&mut transaction, user_id, &message.conversation_id).await?;
             sqlx::query(
                 "INSERT INTO messages \
                     (id, conversation_id, msg_id, type, content, position, \
@@ -121,6 +130,7 @@ impl SqliteConversationRepository {
         let mut transaction = begin_immediate(&self.pool).await?;
 
         let result: Result<(), DbError> = async {
+            Self::ensure_active_for_write(&mut transaction, user_id, &message.conversation_id).await?;
             let result = sqlx::query(
                 "INSERT INTO messages \
                 (id, conversation_id, msg_id, type, content, position, \
@@ -301,6 +311,22 @@ impl IConversationRepository for SqliteConversationRepository {
             .await?;
 
         Ok(row)
+    }
+
+    async fn get_active(&self, user_id: &str, id: &str) -> Result<Option<ConversationRow>, DbError> {
+        let row = sqlx::query("SELECT * FROM conversations WHERE user_id = ? AND id = ?")
+            .bind(user_id)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| {
+            if row.try_get::<Option<i64>, _>("archived_at")?.is_some() {
+                tracing::info!(conversation_id = id, "Rejected incoming work for archived conversation");
+                return Err(DbError::Archived(id.to_owned()));
+            }
+            Ok(ConversationRow::from_row(&row)?)
+        })
+        .transpose()
     }
 
     async fn owner_user_id(&self, id: &str) -> Result<Option<String>, DbError> {
@@ -1811,6 +1837,80 @@ mod tests {
     }
 
     const SYSTEM_USER_ID: &str = "system_default_user";
+
+    #[tokio::test]
+    async fn archived_conversation_rejects_incoming_writes_but_keeps_history_and_restores() {
+        let (repo, db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        let mut message = sample_message(&conv.id);
+        repo.insert_message(SYSTEM_USER_ID, &message).await.unwrap();
+        sqlx::query("UPDATE conversations SET archived_at = 1 WHERE id = ?")
+            .bind(&conv.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(repo.get(SYSTEM_USER_ID, &conv.id).await.unwrap().is_some());
+        assert!(matches!(
+            repo.get_active(SYSTEM_USER_ID, &conv.id).await,
+            Err(DbError::Archived(_))
+        ));
+        assert!(repo.get_active("other-user", &conv.id).await.unwrap().is_none());
+        message.content = r#"{"content":"rejected"}"#.into();
+        assert!(matches!(
+            repo.upsert_message(SYSTEM_USER_ID, &message).await,
+            Err(DbError::Archived(_))
+        ));
+        let stored = repo
+            .get_message(SYSTEM_USER_ID, &conv.id, &message.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(stored.content, message.content);
+        message.id = "new-archived-message".into();
+        assert!(matches!(
+            repo.insert_message(SYSTEM_USER_ID, &message).await,
+            Err(DbError::Archived(_))
+        ));
+        assert!(
+            repo.get_message(SYSTEM_USER_ID, &conv.id, &message.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("UPDATE conversations SET archived_at = NULL WHERE id = ?")
+            .bind(&conv.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        repo.insert_message(SYSTEM_USER_ID, &message).await.unwrap();
+        assert!(repo.get_active(SYSTEM_USER_ID, &conv.id).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn archived_state_is_rechecked_after_an_incoming_write_waits_for_the_writer_lock() {
+        let (repo, db) = setup().await;
+        let conv = sample_conversation(SYSTEM_USER_ID);
+        repo.create(&conv).await.unwrap();
+        let mut archive = begin_immediate(db.pool()).await.unwrap();
+        sqlx::query("UPDATE conversations SET archived_at = 1 WHERE id = ?")
+            .bind(&conv.id)
+            .execute(&mut *archive)
+            .await
+            .unwrap();
+        let message = sample_message(&conv.id);
+        let write = repo.insert_message(SYSTEM_USER_ID, &message);
+        tokio::pin!(write);
+        assert!(timeout(Duration::from_millis(25), &mut write).await.is_err());
+        archive.commit().await.unwrap();
+        assert!(matches!(write.await, Err(DbError::Archived(_))));
+        assert!(
+            repo.get_message(SYSTEM_USER_ID, &conv.id, &message.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[tokio::test]
     async fn cancelled_immediate_transaction_rolls_back_before_pool_reuse() {

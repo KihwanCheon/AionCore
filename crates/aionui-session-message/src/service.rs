@@ -288,6 +288,7 @@ impl SessionMessageService {
                     to: to.to_owned(),
                 })
             }
+            Err(DeliverAttemptError::Archived(_)) => Err(SessionMessageError::TargetArchived { id: to.to_owned() }),
             Err(DeliverAttemptError::Hard(reason)) => Err(SessionMessageError::TransportUnavailable { reason }),
         }
     }
@@ -419,6 +420,7 @@ impl SessionMessageService {
 
 #[derive(Debug)]
 enum DeliverAttemptError {
+    Archived(String),
     /// Try again on the next tick. Carries the rendered cause for logging only.
     Transient(String),
     /// A real answer: drop the item and `warn`.
@@ -444,6 +446,7 @@ enum DeliverAttemptError {
 /// dropped, or a bad reference would be retried until its TTL for no reason.
 fn classify_delivery_failure(error: ConversationError) -> DeliverAttemptError {
     match &error {
+        ConversationError::Archived { .. } => DeliverAttemptError::Archived(error.to_string()),
         ConversationError::Busy { .. } | ConversationError::RuntimeRestarting { .. } => {
             DeliverAttemptError::Transient(error.to_string())
         }
@@ -458,6 +461,7 @@ impl DeliverySink for SessionMessageService {
             Ok(_) => DeliveryOutcome::Delivered,
             Err(DeliverAttemptError::Transient(_)) => DeliveryOutcome::Busy,
             Err(DeliverAttemptError::Hard(reason)) => DeliveryOutcome::HardError(reason),
+            Err(DeliverAttemptError::Archived(reason)) => DeliveryOutcome::HardError(reason),
         }
     }
 }

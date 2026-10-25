@@ -469,7 +469,7 @@ impl ConversationService {
     ) -> Result<(), ConversationError> {
         let row = self
             .conversation_repo
-            .get(user_id, conversation_id)
+            .get_active(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
@@ -3738,7 +3738,7 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
         self.conversation_repo
-            .get(user_id, conversation_id)
+            .get_active(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
@@ -3783,7 +3783,7 @@ impl ConversationService {
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<(), ConversationError> {
         self.conversation_repo
-            .get(user_id, conversation_id)
+            .get_active(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
@@ -4125,7 +4125,7 @@ impl ConversationService {
         // Verify conversation exists and belongs to user
         let row = self
             .conversation_repo
-            .get(user_id, conversation_id)
+            .get_active(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
@@ -4424,7 +4424,7 @@ impl ConversationService {
 
         let row = self
             .conversation_repo
-            .get(&request.user_id, &request.conversation_id)
+            .get_active(&request.user_id, &request.conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: request.conversation_id.clone(),
@@ -4923,7 +4923,7 @@ impl ConversationService {
     ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
         let row = self
             .conversation_repo
-            .get(user_id, conversation_id)
+            .get_active(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
@@ -4969,7 +4969,7 @@ impl ConversationService {
     ) -> Result<EnsureConversationRuntimeResponse, ConversationError> {
         let row = self
             .conversation_repo
-            .get(user_id, conversation_id)
+            .get_active(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
@@ -5056,7 +5056,7 @@ impl ConversationService {
     ) -> Result<(AgentInstance, bool), ConversationError> {
         let row = self
             .conversation_repo
-            .get(user_id, conversation_id)
+            .get_active(user_id, conversation_id)
             .await?
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),

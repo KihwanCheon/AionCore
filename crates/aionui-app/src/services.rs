@@ -388,6 +388,7 @@ impl AppServices {
         let runtime_token_service = Arc::new(RuntimeTokenService::new());
         let task_manager_concrete = Arc::new(
             WorkerTaskManagerImpl::new_with_active_leases(factory, active_lease_registry.clone())
+                .with_conversation_repository(conversation_repo.clone())
                 .with_runtime_token_service(runtime_token_service.clone()),
         );
         let worker_task_manager: Arc<dyn IWorkerTaskManager> = task_manager_concrete.clone();

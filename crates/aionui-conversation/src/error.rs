@@ -196,6 +196,10 @@ impl From<DbError> for ConversationError {
     fn from(error: DbError) -> Self {
         match error {
             DbError::NotFound(reason) => Self::NotFoundReason { reason },
+            DbError::Archived(id) => Self::Archived {
+                id,
+                reason: "This conversation is in the archive. Restore it before sending or starting an agent.".into(),
+            },
             DbError::Conflict(reason) => Self::Busy { reason },
             DbError::Query(e) => Self::Internal {
                 reason: format!("Database error: {e}"),

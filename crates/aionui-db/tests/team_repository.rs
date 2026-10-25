@@ -169,9 +169,79 @@ async fn list_teams_by_user_excludes_archived() {
     assert_eq!(active.len(), 1);
     assert_eq!(active[0].id, "t1");
 
-    // ...but the restore path is unaffected and still sees it.
+    // Startup must not restore archived runtimes. History/deletion reads remain available.
     let all = repo.list_teams_for_restore().await.unwrap();
-    assert_eq!(all.len(), 2);
+    assert_eq!(all.len(), 1);
+    assert!(repo.get_team_for_restore("t2").await.unwrap().is_some());
+    assert!(matches!(
+        repo.get_active_team_for_runtime("t2").await,
+        Err(aionui_db::DbError::Archived(_))
+    ));
+}
+
+#[tokio::test]
+async fn archived_team_rejects_mailbox_writes_and_accepts_them_after_restore() {
+    let (repo, db) = repo().await;
+    repo.create_team(&make_team_for_user("archived-team", "user-a", "Archived"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE teams SET archived_at = 1 WHERE id = 'archived-team'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let message = make_mailbox_msg("archived-message", "archived-team", "a1", "a2", "message");
+    assert!(matches!(
+        repo.write_message("user-a", &message).await,
+        Err(aionui_db::DbError::NotFound(id)) if id == "team archived-team"
+    ));
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = 'archived-team'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    sqlx::query("UPDATE teams SET archived_at = NULL WHERE id = 'archived-team'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    repo.write_message("user-a", &message).await.unwrap();
+}
+
+#[tokio::test]
+async fn individually_archived_member_rejects_every_mailbox_message_type() {
+    let (repo, db) = repo().await;
+    repo.create_team(&make_team("active-team", "Active")).await.unwrap();
+    sqlx::query("INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at, archived_at) VALUES ('conv-1', 'system_default_user', 'Member', 'acp', '{}', 1, 1, 1)")
+        .execute(db.pool()).await.unwrap();
+
+    for msg_type in ["message", "idle_notification", "shutdown_request"] {
+        let message = make_mailbox_msg(msg_type, "active-team", "a1", "a2", msg_type);
+        assert!(matches!(
+            repo.write_message(DEFAULT_USER_ID, &message).await,
+            Err(DbError::NotFound(id)) if id == "team active-team"
+        ));
+    }
+    let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mailbox WHERE team_id = 'active-team'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    repo.write_message(
+        DEFAULT_USER_ID,
+        &make_mailbox_msg("other-member", "active-team", "a2", "a1", "message"),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE conversations SET archived_at = NULL WHERE id = 'conv-1'")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    repo.write_message(
+        DEFAULT_USER_ID,
+        &make_mailbox_msg("restored-member", "active-team", "a1", "a2", "message"),
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

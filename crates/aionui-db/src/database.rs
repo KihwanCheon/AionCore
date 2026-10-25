@@ -733,7 +733,7 @@ fn should_attempt_recovery(err: &DbError) -> bool {
     match err {
         DbError::Migration(sqlx::migrate::MigrateError::VersionMismatch(_)) => false,
         DbError::Migration(_) => is_corruption_like_error(err),
-        DbError::NotFound(_) | DbError::Conflict(_) => false,
+        DbError::NotFound(_) | DbError::Conflict(_) | DbError::Archived(_) => false,
         DbError::Query(_) | DbError::Init(_) => is_corruption_like_error(err),
     }
 }
