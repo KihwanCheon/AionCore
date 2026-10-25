@@ -123,6 +123,25 @@ pub trait IConversationRepository: Send + Sync {
         Ok(None)
     }
 
+    /// Returns snapshots for the requested conversations owned by this user.
+    /// Missing IDs are omitted; duplicate IDs are returned once. Order is unspecified.
+    async fn get_assistant_snapshots(
+        &self,
+        user_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<Vec<ConversationAssistantSnapshotRow>, DbError> {
+        let mut seen = std::collections::HashSet::new();
+        let mut snapshots = Vec::new();
+        for id in conversation_ids {
+            if seen.insert(id)
+                && let Some(snapshot) = self.get_assistant_snapshot(user_id, id).await?
+            {
+                snapshots.push(snapshot);
+            }
+        }
+        Ok(snapshots)
+    }
+
     /// Inserts or updates a persisted assistant snapshot for a conversation.
     async fn upsert_assistant_snapshot(
         &self,

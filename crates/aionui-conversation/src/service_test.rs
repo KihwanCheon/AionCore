@@ -60,6 +60,8 @@ use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, Conversat
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
+#[path = "service_test/conversation_list_test.rs"]
+mod conversation_list_test;
 #[path = "service_test/external_report_test.rs"]
 mod external_report_test;
 
@@ -75,6 +77,7 @@ struct RecordedViewSync {
 
 struct RecordingSkillResolver {
     names: Vec<String>,
+    auto_inject_calls: AtomicUsize,
     views: Arc<Mutex<Vec<RecordedViewSync>>>,
     view_removals: Arc<Mutex<Vec<(String, String)>>>,
 }
@@ -126,6 +129,7 @@ impl RecordingSkillResolver {
     fn new(names: Vec<String>) -> Self {
         Self {
             names,
+            auto_inject_calls: AtomicUsize::new(0),
             views: Arc::new(Mutex::new(Vec::new())),
             view_removals: Arc::new(Mutex::new(Vec::new())),
         }
@@ -135,6 +139,7 @@ impl RecordingSkillResolver {
 #[async_trait::async_trait]
 impl SkillResolver for RecordingSkillResolver {
     async fn auto_inject_names(&self) -> Vec<String> {
+        self.auto_inject_calls.fetch_add(1, Ordering::SeqCst);
         self.names.clone()
     }
 
@@ -238,6 +243,9 @@ struct MockRepo {
     choice_notices: Mutex<Vec<ChoiceNoticeRow>>,
     artifacts: Mutex<Vec<ConversationArtifactRow>>,
     assistant_snapshots: Mutex<Vec<ConversationAssistantSnapshotRow>>,
+    snapshot_reads: AtomicUsize,
+    snapshot_batch_reads: AtomicUsize,
+    fail_snapshot_reads: AtomicBool,
 }
 
 impl MockRepo {
@@ -248,6 +256,9 @@ impl MockRepo {
             choice_notices: Mutex::new(vec![]),
             artifacts: Mutex::new(vec![]),
             assistant_snapshots: Mutex::new(vec![]),
+            snapshot_reads: AtomicUsize::new(0),
+            snapshot_batch_reads: AtomicUsize::new(0),
+            fail_snapshot_reads: AtomicBool::new(false),
         }
     }
 }
@@ -397,8 +408,37 @@ impl IConversationRepository for MockRepo {
         _user_id: &str,
         conversation_id: &str,
     ) -> Result<Option<ConversationAssistantSnapshotRow>, aionui_db::DbError> {
+        self.snapshot_reads.fetch_add(1, Ordering::SeqCst);
+        if self.fail_snapshot_reads.load(Ordering::SeqCst) {
+            return Err(DbError::Init("snapshot read failed".into()));
+        }
         let rows = self.assistant_snapshots.lock().unwrap();
         Ok(rows.iter().find(|row| row.conversation_id == conversation_id).cloned())
+    }
+
+    async fn get_assistant_snapshots(
+        &self,
+        user_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<Vec<ConversationAssistantSnapshotRow>, DbError> {
+        self.snapshot_batch_reads.fetch_add(1, Ordering::SeqCst);
+        if self.fail_snapshot_reads.load(Ordering::SeqCst) {
+            return Err(DbError::Init("snapshot read failed".into()));
+        }
+        let rows = self.rows.lock().unwrap();
+        let allowed: std::collections::HashSet<_> = rows
+            .iter()
+            .filter(|row| row.user_id == user_id && conversation_ids.contains(&row.id))
+            .map(|row| row.id.as_str())
+            .collect();
+        Ok(self
+            .assistant_snapshots
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|snapshot| allowed.contains(snapshot.conversation_id.as_str()))
+            .cloned()
+            .collect())
     }
 
     async fn upsert_assistant_snapshot(
@@ -8962,6 +9002,9 @@ async fn existing_conversation_reads_current_assistant_identity() {
     }))
     .unwrap();
     let created = svc.create("user-1", req).await.unwrap();
+
+    let initial_list = svc.list("user-1", ListConversationsQuery::default()).await.unwrap();
+    assert_eq!(initial_list.items[0].assistant.as_ref().unwrap().name, "Old Name");
 
     definition_repo
         .upsert_for_user(

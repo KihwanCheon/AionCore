@@ -1,6 +1,7 @@
 mod managed;
 mod system;
 mod types;
+mod validation_cache;
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -20,6 +21,8 @@ pub use types::{
 
 static MANAGED_RUNTIME_CACHE: OnceLock<tokio::sync::Mutex<Option<ResolvedNodeRuntime>>> = OnceLock::new();
 static MANAGED_RUNTIME_INSTALL_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+static MANAGED_RUNTIME_VALIDATION: validation_cache::RuntimeValidationCache =
+    validation_cache::RuntimeValidationCache::new(Duration::from_secs(300));
 
 pub fn probe_runtime_command(command: &str) -> RuntimeCommandProbe {
     let trimmed = command.trim();
@@ -74,6 +77,7 @@ pub async fn ensure_node_runtime_with_reporter(
     }
 
     let runtime = install_managed_runtime_with_reporter(reporter).await?;
+    MANAGED_RUNTIME_VALIDATION.remember(&runtime).await;
     *managed_runtime_cache().lock().await = Some(runtime.clone());
     log_runtime_selected(&runtime);
     Ok(runtime)
@@ -149,12 +153,16 @@ async fn cached_managed_runtime_unreported() -> Option<ResolvedNodeRuntime> {
 }
 
 async fn cached_managed_runtime(reporter: Option<&dyn NodeRuntimeProgressReporter>) -> Option<ResolvedNodeRuntime> {
-    let cached = managed_runtime_cache().lock().await.clone()?;
+    let mut cache = managed_runtime_cache().lock().await;
+    let cached = cache.as_ref()?;
 
-    match managed::validate_managed_runtime(&cached.root, reporter).await {
+    match MANAGED_RUNTIME_VALIDATION
+        .resolve(cached, || managed::validate_managed_runtime(&cached.root, reporter))
+        .await
+    {
         Ok(runtime) => {
             emit_runtime_ready(reporter, &runtime);
-            *managed_runtime_cache().lock().await = Some(runtime.clone());
+            *cache = Some(runtime.clone());
             Some(runtime)
         }
         Err(error) => {
@@ -163,7 +171,7 @@ async fn cached_managed_runtime(reporter: Option<&dyn NodeRuntimeProgressReporte
                 root = %cached.root.display(),
                 "managed node runtime cache invalidated"
             );
-            *managed_runtime_cache().lock().await = None;
+            *cache = None;
             None
         }
     }
@@ -336,8 +344,10 @@ fn truncate_for_log(text: &str, limit: usize) -> String {
 }
 
 async fn command_version_once(command: ResolvedCommand, label: &str) -> Result<semver::Version, NodeRuntimeError> {
+    let started = std::time::Instant::now();
     let mut builder = crate::Builder::from_resolved(&command);
     builder.arg("--version");
+    info!(label, "node runtime version probe started");
 
     // AIONUI-62: the failure detail below is logged as structured fields ONLY and is
     // deliberately kept out of the returned error message. `classify_error` (managed.rs)
@@ -360,6 +370,7 @@ async fn command_version_once(command: ResolvedCommand, label: &str) -> Result<s
                 program = %command.program.display(),
                 io_kind = ?error.kind(),
                 os_error = ?error.raw_os_error(),
+                elapsed_ms = started.elapsed().as_millis() as u64,
                 "node runtime --version probe failed to start"
             );
             return Err(NodeRuntimeError::managed_invalid(format!(
@@ -373,6 +384,7 @@ async fn command_version_once(command: ResolvedCommand, label: &str) -> Result<s
             label,
             program = %command.program.display(),
             exit_code = ?output.status.code(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
             stderr = %sanitize_probe_stderr(&output.stderr, PROBE_STDERR_LOG_LIMIT),
             "node runtime --version probe exited unsuccessfully"
         );
@@ -382,7 +394,16 @@ async fn command_version_once(command: ResolvedCommand, label: &str) -> Result<s
         )));
     }
 
-    parse_version_output(std::str::from_utf8(&output.stdout).unwrap_or_default(), label)
+    let result = parse_version_output(std::str::from_utf8(&output.stdout).unwrap_or_default(), label);
+    if started.elapsed() >= Duration::from_secs(1) {
+        info!(
+            label,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            success = result.is_ok(),
+            "slow node runtime version probe"
+        );
+    }
+    result
 }
 
 fn parse_version_output(output: &str, label: &str) -> Result<semver::Version, NodeRuntimeError> {
@@ -468,6 +489,7 @@ mod tests {
         String::from_utf8(buffer.lock().expect("lock").clone()).expect("utf8")
     }
 
+    #[cfg(unix)]
     fn write_executable(path: &std::path::Path, body: &str) {
         fs::write(path, body).expect("write executable");
         #[cfg(unix)]
@@ -479,23 +501,71 @@ mod tests {
         }
     }
 
-    fn fake_managed_runtime(root: &std::path::Path) -> ResolvedNodeRuntime {
-        let bin = root.join("bin");
-        fs::create_dir_all(&bin).expect("create runtime bin");
-        write_executable(&bin.join("node"), "#!/bin/sh\necho v24.11.0\n");
-        write_executable(&bin.join("npm"), "#!/bin/sh\necho 24.11.0\n");
-        write_executable(&bin.join("npx"), "#!/bin/sh\necho 24.11.0\n");
+    async fn fake_managed_runtime(root: &std::path::Path) -> ResolvedNodeRuntime {
+        #[cfg(windows)]
+        {
+            // Use a real executable so the production version-probe chain is
+            // exercised on Windows too; Unix shell scripts cannot run here.
+            fs::create_dir_all(root.join("node_modules/npm/bin")).expect("create runtime");
+            let source = root.join("version_fixture.rs");
+            fs::write(
+                &source,
+                r#"
+                use std::io::Write;
+                fn main() {
+                    let executable = std::env::current_exe().unwrap();
+                    let counter = executable.parent().unwrap().join("probe-count");
+                    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(counter).unwrap();
+                    file.write_all(b"x").unwrap();
+                    println!("v24.11.0");
+                }
+            "#,
+            )
+            .expect("write version fixture");
+            let node = root.join("node.exe");
+            let compiler = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+            let mut builder = crate::Builder::clean_cli(compiler);
+            builder.arg(&source).arg("-o").arg(&node);
+            let output = builder.output().await.expect("compile version fixture");
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+            let npm = root.join("node_modules/npm/bin/npm-cli.js");
+            let npx = root.join("node_modules/npm/bin/npx-cli.js");
+            fs::write(&npm, "// npm fixture").unwrap();
+            fs::write(&npx, "// npx fixture").unwrap();
+            ResolvedNodeRuntime {
+                source: ResolvedNodeSource::Managed,
+                root: root.to_owned(),
+                version: semver::Version::new(0, 0, 0),
+                node_path: node.clone(),
+                npm_path: node.clone(),
+                npm_args_prefix: vec![npm.into_os_string()],
+                npx_path: node,
+                npx_args_prefix: vec![npx.into_os_string()],
+                env: vec![],
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let bin = root.join("bin");
+            fs::create_dir_all(&bin).expect("create runtime bin");
+            for tool in ["node", "npm", "npx"] {
+                write_executable(
+                    &bin.join(tool),
+                    "#!/bin/sh\nprintf x >> \"$(dirname \"$0\")/../probe-count\"\necho v24.11.0\n",
+                );
+            }
 
-        ResolvedNodeRuntime {
-            source: ResolvedNodeSource::Managed,
-            root: root.to_path_buf(),
-            version: semver::Version::new(0, 0, 0),
-            node_path: bin.join("node"),
-            npm_path: bin.join("npm"),
-            npm_args_prefix: vec![],
-            npx_path: bin.join("npx"),
-            npx_args_prefix: vec![],
-            env: vec![],
+            ResolvedNodeRuntime {
+                source: ResolvedNodeSource::Managed,
+                root: root.to_path_buf(),
+                version: semver::Version::new(0, 0, 0),
+                node_path: bin.join("node"),
+                npm_path: bin.join("npm"),
+                npm_args_prefix: vec![],
+                npx_path: bin.join("npx"),
+                npx_args_prefix: vec![],
+                env: vec![],
+            }
         }
     }
 
@@ -886,7 +956,7 @@ mod tests {
         let _guard = test_managed_runtime_cache_lock().lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("node-v24.11.0-test");
-        let runtime = fake_managed_runtime(&root);
+        let runtime = fake_managed_runtime(&root).await;
         *managed_runtime_cache().lock().await = Some(runtime.clone());
 
         let cached = cached_managed_runtime_unreported()
@@ -911,7 +981,7 @@ mod tests {
         let _guard = test_managed_runtime_cache_lock().lock().await;
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path().join("node-v24.11.0-test");
-        let runtime = fake_managed_runtime(&root);
+        let runtime = fake_managed_runtime(&root).await;
         *managed_runtime_cache().lock().await = Some(runtime.clone());
 
         let phases = Arc::new(Mutex::new(Vec::<NodeRuntimeProgressPhase>::new()));
@@ -932,6 +1002,20 @@ mod tests {
             vec![NodeRuntimeProgressPhase::Validating, NodeRuntimeProgressPhase::Ready]
         );
 
+        *managed_runtime_cache().lock().await = None;
+    }
+
+    #[tokio::test]
+    async fn cached_managed_runtime_reuses_successful_version_probes() {
+        let _guard = test_managed_runtime_cache_lock().lock().await;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let runtime = fake_managed_runtime(tmp.path()).await;
+        *managed_runtime_cache().lock().await = Some(runtime);
+        let first = cached_managed_runtime_unreported().await.expect("first validation");
+        let (second, third) = tokio::join!(cached_managed_runtime_unreported(), cached_managed_runtime_unreported());
+        assert_eq!(second.unwrap().version, first.version);
+        assert_eq!(third.unwrap().version, first.version);
+        assert_eq!(fs::read(tmp.path().join("probe-count")).unwrap(), b"xxx");
         *managed_runtime_cache().lock().await = None;
     }
 }

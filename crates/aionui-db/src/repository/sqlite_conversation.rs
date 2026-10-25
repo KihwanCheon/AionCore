@@ -715,6 +715,36 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(row)
     }
 
+    async fn get_assistant_snapshots(
+        &self,
+        user_id: &str,
+        conversation_ids: &[String],
+    ) -> Result<Vec<ConversationAssistantSnapshotRow>, DbError> {
+        let mut seen = std::collections::HashSet::new();
+        let ids: Vec<_> = conversation_ids.iter().filter(|id| seen.insert(id.as_str())).collect();
+        let mut snapshots = Vec::new();
+        // Stay below SQLite's older 999-bind limit, including the user binding.
+        for chunk in ids.chunks(500) {
+            let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT s.* FROM conversation_assistant_snapshots s \
+                 INNER JOIN conversations c ON c.id = s.conversation_id WHERE c.user_id = ",
+            );
+            query.push_bind(user_id).push(" AND s.conversation_id IN (");
+            let mut separated = query.separated(", ");
+            for id in chunk {
+                separated.push_bind(id.as_str());
+            }
+            separated.push_unseparated(")");
+            snapshots.extend(
+                query
+                    .build_query_as::<ConversationAssistantSnapshotRow>()
+                    .fetch_all(&self.pool)
+                    .await?,
+            );
+        }
+        Ok(snapshots)
+    }
+
     async fn upsert_assistant_snapshot(
         &self,
         user_id: &str,

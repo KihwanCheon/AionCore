@@ -6,6 +6,42 @@ use aionui_db::{
 
 const USER_ID: &str = "system_default_user";
 
+async fn seed_snapshot_definition(db: &aionui_db::Database) {
+    sqlx::query(
+        "INSERT INTO assistant_definitions (
+            id, assistant_id, source, owner_type, name, agent_id, rule_resource_type,
+            default_model_mode, default_permission_mode, default_skills_mode,
+            default_mcps_mode, created_at, updated_at
+         ) VALUES ('batch-definition', 'batch-assistant', 'builtin', 'system', 'Batch',
+                   'codex', 'none', 'auto', 'auto', 'auto', 'auto', 1, 1)",
+    )
+    .execute(db.pool())
+    .await
+    .unwrap();
+}
+
+fn snapshot_params(id: &str) -> aionui_db::UpsertConversationAssistantSnapshotParams<'_> {
+    aionui_db::UpsertConversationAssistantSnapshotParams {
+        conversation_id: id,
+        assistant_definition_id: "batch-definition",
+        assistant_id: "batch-assistant",
+        assistant_source: "builtin",
+        agent_id: "codex",
+        rules_content: "snapshot rules",
+        default_model_mode: "auto",
+        resolved_model_id: None,
+        default_permission_mode: "auto",
+        resolved_permission_value: None,
+        default_thought_level_mode: "auto",
+        resolved_thought_level_value: None,
+        default_skills_mode: "auto",
+        resolved_skill_ids: "[]",
+        resolved_disabled_builtin_skill_ids: "[]",
+        default_mcps_mode: "auto",
+        resolved_mcp_ids: "[]",
+    }
+}
+
 async fn setup() -> (SqliteConversationRepository, aionui_db::Database) {
     let db = init_database_memory().await.unwrap();
     let repo = SqliteConversationRepository::new(db.pool().clone());
@@ -100,6 +136,79 @@ fn make_choice_notice(
 }
 
 // ── Conversation CRUD ───────────────────────────────────────────────
+
+#[tokio::test]
+async fn batch_snapshots_are_user_scoped_and_omit_duplicates_and_missing_ids() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    seed_snapshot_definition(&db).await;
+    let own = make_conversation("own");
+    let mut other = make_conversation("other");
+    other.user_id = "user_2".into();
+    let no_snapshot = make_conversation("no-snapshot");
+    for row in [&own, &other, &no_snapshot] {
+        repo.create(row).await.unwrap();
+    }
+    for row in [&own, &other] {
+        repo.upsert_assistant_snapshot(&row.user_id, &snapshot_params(&row.id))
+            .await
+            .unwrap();
+    }
+    let ids = vec![
+        own.id.clone(),
+        other.id.clone(),
+        own.id.clone(),
+        no_snapshot.id,
+        "missing".into(),
+    ];
+    let snapshots = repo.get_assistant_snapshots(USER_ID, &ids).await.unwrap();
+    assert_eq!(
+        snapshots.iter().map(|row| &row.conversation_id).collect::<Vec<_>>(),
+        vec![&own.id]
+    );
+    assert_eq!(snapshots[0].rules_content, "snapshot rules");
+    let other_snapshots = repo.get_assistant_snapshots("user_2", &ids).await.unwrap();
+    assert_eq!(
+        other_snapshots
+            .iter()
+            .map(|row| &row.conversation_id)
+            .collect::<Vec<_>>(),
+        vec![&other.id]
+    );
+}
+
+#[tokio::test]
+async fn batch_snapshots_support_large_pages_without_sqlite_bind_overflow() {
+    let (repo, db) = setup().await;
+    seed_snapshot_definition(&db).await;
+    let mut ids = Vec::new();
+    for index in 0..1005 {
+        let row = make_conversation(&index.to_string());
+        repo.create(&row).await.unwrap();
+        repo.upsert_assistant_snapshot(USER_ID, &snapshot_params(&row.id))
+            .await
+            .unwrap();
+        ids.push(row.id);
+    }
+    ids.push(ids[0].clone());
+    let snapshots = repo.get_assistant_snapshots(USER_ID, &ids).await.unwrap();
+    assert_eq!(snapshots.len(), 1005);
+    assert_eq!(
+        snapshots
+            .iter()
+            .map(|row| &row.conversation_id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        1005
+    );
+}
+
+#[tokio::test]
+async fn batch_snapshots_do_not_query_the_database_for_an_empty_page() {
+    let (repo, db) = setup().await;
+    db.pool().close().await;
+    assert!(repo.get_assistant_snapshots(USER_ID, &[]).await.unwrap().is_empty());
+}
 
 #[tokio::test]
 async fn create_get_update_delete_lifecycle() {

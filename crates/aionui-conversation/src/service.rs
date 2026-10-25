@@ -1,3 +1,4 @@
+mod conversation_list;
 mod external_report;
 mod mcp_reload;
 pub mod native_history;
@@ -33,7 +34,7 @@ use aionui_api_types::{
     MessageSearchResponse, PromptCapabilityView, RegisterChoiceNoticeRequest, SearchMessagesQuery, SendMessageRequest,
     SendMessageResponse, SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection,
     TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage,
-    assistant_avatar_response_value, assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
+    assistant_avatar_response_value, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ActiveConversationRuntime, ChatFileRef, SessionRef};
 use aionui_common::{
@@ -46,7 +47,7 @@ use aionui_db::models::{
     MessageRow,
 };
 use aionui_db::{
-    AgentBindingResolution, ConversationFilters, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
+    AgentBindingResolution, ConversationRowUpdate, CreateAcpSessionParams, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantPreferenceRepository, IConversationRepository, IMcpServerRepository, IProviderRepository,
     MessagePageCursor, MessagePageDirection, MessagePageParams, SaveRuntimeStateParams,
@@ -1126,32 +1127,11 @@ impl ConversationService {
         let current_definition = self
             .current_assistant_definition(user_id, &snapshot.assistant_id)
             .await?;
-        let (source, name, avatar) = match current_definition {
-            Some(definition) => (
-                definition.source,
-                definition.name,
-                assistant_avatar_response_value_with_version(
-                    definition.avatar_type.as_str(),
-                    definition.avatar_value.as_deref(),
-                    definition.assistant_id.as_str(),
-                    definition.updated_at,
-                )
-                .unwrap_or_default(),
-            ),
-            None => (
-                snapshot.assistant_source.clone(),
-                snapshot.assistant_id.clone(),
-                String::new(),
-            ),
-        };
-
-        Ok(aionui_api_types::ConversationAssistantIdentityResponse {
-            id: snapshot.assistant_id.clone(),
-            source,
-            name,
-            avatar,
-            backend: runtime_backend,
-        })
+        Ok(conversation_list::assistant_identity(
+            snapshot,
+            runtime_backend,
+            current_definition.as_ref(),
+        ))
     }
 
     async fn current_assistant_definition(
@@ -2353,53 +2333,7 @@ impl ConversationService {
         user_id: &str,
         query: ListConversationsQuery,
     ) -> Result<ConversationListResponse, ConversationError> {
-        let filters = ConversationFilters {
-            cursor: query.cursor,
-            limit: query.limit.unwrap_or(0),
-            source: query.source,
-            cron_job_id: query.cron_job_id,
-            pinned: query.pinned,
-        };
-
-        let result = self.conversation_repo.list_paginated(user_id, &filters).await?;
-
-        // Tolerate per-row deserialization failures — a single legacy row
-        // (e.g. an abandoned agent_type='gemini' conversation post-migration)
-        // must not take down the whole listing. Skip-and-log is the
-        // explicit resilience contract from the Gemini→ACP migration spec.
-        let mut items = Vec::with_capacity(result.items.len());
-        for row in result.items {
-            let row_id = row.id.clone();
-            let mut extra: serde_json::Value = match serde_json::from_str(&row.extra) {
-                Ok(v) => v,
-                Err(err) => {
-                    warn!(
-                        conversation_id = %row_id,
-                        error = %ErrorChain(&err),
-                        "Skipping unreadable conversation row in list"
-                    );
-                    continue;
-                }
-            };
-            self.backfill_extra_inplace(user_id, &row_id, &mut extra).await;
-            match row_to_response_with_extra(row, extra, &self.workspace_root) {
-                Ok(mut resp) => {
-                    self.attach_assistant_identity(user_id, &mut resp).await?;
-                    items.push(resp);
-                }
-                Err(err) => warn!(
-                    conversation_id = %row_id,
-                    error = %ErrorChain(&err),
-                    "Skipping unreadable conversation row in list"
-                ),
-            }
-        }
-
-        Ok(PaginatedResult {
-            items,
-            total: result.total,
-            has_more: result.has_more,
-        })
+        self.list_with_shared_metadata(user_id, query).await
     }
 
     /// Update a conversation (partial update with extra-merge semantics).
@@ -5381,7 +5315,18 @@ impl ConversationService {
     /// failure.
     async fn backfill_extra_inplace(&self, user_id: &str, conversation_id: &str, extra: &mut serde_json::Value) {
         let auto_inject = self.skill_resolver.auto_inject_names().await;
-        let mut mutated = backfill_skills_if_missing(extra, &auto_inject);
+        self.backfill_extra_with_skills(user_id, conversation_id, extra, &auto_inject)
+            .await;
+    }
+
+    async fn backfill_extra_with_skills(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        extra: &mut serde_json::Value,
+        auto_inject: &[String],
+    ) {
+        let mut mutated = backfill_skills_if_missing(extra, auto_inject);
         mutated |= backfill_cron_job_id_alias(extra);
         if !mutated {
             return;
