@@ -3,8 +3,9 @@
 //! Cross-session message delivery.
 //!
 //! Delivery delegates to `ConversationService::send_message` — the human send
-//! path — so "cross-session delivery ≡ a human pressing send" is a structural
-//! guarantee rather than two code paths kept in sync by hand.
+//! path — to share transport behavior rather than keep two paths in sync.
+//! The recipient block identifies an inter-agent report or request; reusing the
+//! transport does not grant user authority or new user approval to its content.
 
 pub mod drainer;
 pub mod error;
