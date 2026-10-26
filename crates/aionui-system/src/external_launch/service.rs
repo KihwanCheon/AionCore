@@ -346,6 +346,7 @@ fn normalize_request(
             mcp_ids: normalize_list(request.mcp_ids)?,
             workspace: normalize_optional(request.workspace, MAX_WORKSPACE_CHARS)?,
             auto_send: request.auto_send,
+            claude_account_id: normalize_optional(request.claude_account_id, MAX_OPTION_CHARS)?,
         },
         callback_url,
     ))
@@ -441,6 +442,7 @@ mod tests {
             mcp_ids: Some(vec!["mcp-a".to_owned()]),
             workspace: Some("D:/workspace".to_owned()),
             auto_send: true,
+            claude_account_id: None,
         }
     }
 

@@ -699,6 +699,7 @@ fn agent_management_row(meta: AgentMetadata, reason: Option<&UnavailableReason>)
         last_failure_at: meta.last_failure_at,
         has_command_override: meta.has_command_override,
         env_override_key_count: meta.env_override_key_count,
+        claude_accounts: None,
     }
 }
 

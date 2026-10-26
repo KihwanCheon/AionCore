@@ -12,6 +12,7 @@ mod assistant;
 mod auth;
 mod channel;
 mod chat_file;
+mod claude_account;
 mod confirmation;
 mod connection_test;
 mod conversation;
@@ -95,6 +96,10 @@ pub use channel::{
     SyncChannelSettingsRequest, TestPluginExtraConfig, TestPluginRequest, TestPluginResponse, UserAuthorizedPayload,
 };
 pub use chat_file::ChatFileRef;
+pub use claude_account::{
+    ClaudeAccount, ClaudeAccountAuthStatus, ClaudeAccountSummary, CreateClaudeAccountRequest,
+    DEFAULT_CLAUDE_ACCOUNT_ID, ReorderClaudeAccountsRequest, UpdateClaudeAccountRequest,
+};
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::ReloadConversationMcpServersRequest;

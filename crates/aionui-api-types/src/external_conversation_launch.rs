@@ -18,6 +18,9 @@ pub struct ExternalConversationLaunchRequest {
     pub workspace: Option<String>,
     #[serde(default)]
     pub auto_send: bool,
+    /// Non-default Claude account for the prepared conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account_id: Option<String>,
 }
 
 /// Browser-safe launch payload. The server-only completion URL is omitted.
@@ -36,6 +39,8 @@ pub struct ExternalConversationLaunchPayload {
     pub mcp_ids: Option<Vec<String>>,
     pub workspace: Option<String>,
     pub auto_send: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,6 +121,7 @@ mod tests {
             mcp_ids: None,
             workspace: None,
             auto_send: true,
+            claude_account_id: None,
         };
 
         let json = serde_json::to_value(payload).unwrap();

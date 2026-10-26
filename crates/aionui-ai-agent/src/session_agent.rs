@@ -2070,10 +2070,19 @@ pub async fn build_session_instance(
         tracing::info!(conv_id = %conversation_id, ?keys, "session spawn env: agent overrides + runtime context");
     }
 
+    // Fork: a non-default Claude account (`extra.claude_account_id`). `None` (the
+    // default account, i.e. every single-account setup) leaves the spawn unchanged.
+    let claude_account = if backend_label == "claude" {
+        crate::claude_accounts::resolve_for_session(config.claude_account_id.as_deref()).await?
+    } else {
+        None
+    };
+
     // GAP #5 — claude cc-switch provider env: inject ANTHROPIC_BASE_URL /
     // ANTHROPIC_AUTH_TOKEN (third-party relay creds) into the spawn, mirroring the
     // legacy ACP-claude path. Empty (no cc-switch config) = byte-identical spawn.
-    if backend_label == "claude" {
+    // Fork: skipped for a non-default account, whose own login must not be overridden.
+    if backend_label == "claude" && claude_account.is_none() {
         let provider_env = crate::cc_switch::read_claude_provider_env();
         if !provider_env.is_empty() {
             let keys: Vec<String> = provider_env.keys().cloned().collect();
@@ -2085,6 +2094,23 @@ pub async fn build_session_instance(
             tracing::info!(conv_id = %conversation_id, ?keys, "cc-switch: provider env injected into claude spawn");
         }
     }
+
+    // Fork: point the spawn at the account's config directory. The catalog
+    // writeback below stays with the default account so the shared agent row
+    // keeps reflecting the default configuration.
+    let catalog_writeback = match claude_account.as_ref() {
+        Some(account) => {
+            crate::claude_accounts::apply_to_session(&mut session_config, account);
+            tracing::info!(
+                conv_id = %conversation_id,
+                account_id = %account.id,
+                shared_settings = account.settings_path.is_some(),
+                "claude account applied to spawn"
+            );
+            None
+        }
+        None => catalog_writeback,
+    };
 
     // GAP #6 — codex sandbox + approval policy resolved from the requested mode
     // (clean-slate codex_sandbox_for_mode / codex_approval_for_mode). A full-access
@@ -5137,6 +5163,49 @@ mod build_mapping_tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    /// Fork: an unknown Claude account must fail before spawn instead of silently
+    /// resuming the session in the default account's config directory.
+    #[tokio::test]
+    async fn unknown_claude_account_fails_before_spawn() {
+        let config = AcpBuildExtra {
+            backend: Some("claude".into()),
+            claude_account_id: Some("unregistered".into()),
+            ..Default::default()
+        };
+        let metadata = test_metadata(Some("claude"), None);
+        let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
+        let spawner = Arc::new(RecordingFailSpawner::default());
+
+        let result = build_session_instance(
+            "claude",
+            SessionBuildInputs {
+                conversation_id: "conv-claude-account".into(),
+                user_id: "user-1".into(),
+                workspace: std::env::current_dir()
+                    .expect("current directory")
+                    .to_string_lossy()
+                    .into_owned(),
+                config: &config,
+                metadata: &metadata,
+                skill_delivery: Default::default(),
+                session_snapshot: None,
+                backend_session_id: None,
+                mcp_server_repo: None,
+                runtime_env: &[],
+                broadcaster,
+                catalog_writeback: None,
+                acp_session_repo: None,
+                prompt_dump_dir: None,
+                permission_hook_body: None,
+            },
+            spawner.clone(),
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(spawner.last_command().is_none(), "no spawn for an unresolved account");
     }
 
     #[tokio::test]

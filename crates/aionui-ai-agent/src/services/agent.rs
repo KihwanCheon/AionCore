@@ -67,7 +67,9 @@ impl AgentService {
 // Agent operations
 impl AgentService {
     pub async fn list_management_agents(&self, user_id: &str) -> Result<Vec<AgentManagementRow>, AgentError> {
-        self.availability.list_management_rows(user_id).await
+        let mut rows = self.availability.list_management_rows(user_id).await?;
+        crate::claude_accounts::attach_management_summaries(&mut rows).await;
+        Ok(rows)
     }
 
     /// Backend → logo URL catalog for business surfaces.
@@ -103,7 +105,9 @@ impl AgentService {
     }
 
     pub async fn health_check_agent_by_id(&self, user_id: &str, id: &str) -> Result<AgentManagementRow, AgentError> {
-        self.availability.run_manual_health_check(user_id, id).await
+        let mut row = self.availability.run_manual_health_check(user_id, id).await?;
+        crate::claude_accounts::attach_management_summaries(std::slice::from_mut(&mut row)).await;
+        Ok(row)
     }
 
     pub async fn provider_health_check(
@@ -165,7 +169,7 @@ impl AgentService {
             .await
             .map_err(|e| AgentError::internal(format!("repo.update_agent_overrides_for_user: {e}")))?;
 
-        self.availability.run_manual_health_check(user_id, id).await
+        self.health_check_agent_by_id(user_id, id).await
     }
 
     pub async fn get_agent_overrides(

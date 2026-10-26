@@ -769,6 +769,14 @@ fn create_conversation_request(options: &ExternalConversationDispatchCreateOptio
     if let Some(workspace) = options.workspace.as_ref() {
         extra["workspace"] = Value::String(workspace.clone());
     }
+    if let Some(account_id) = options
+        .claude_account_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        extra["claude_account_id"] = Value::String(account_id.to_owned());
+    }
 
     CreateConversationRequest {
         r#type: None,
@@ -1054,6 +1062,7 @@ mod tests {
             disabled_builtin_skill_ids: None,
             mcp_ids: None,
             workspace: None,
+            claude_account_id: None,
         });
         assert!(matches!(
             validate_request(&invalid),
@@ -1075,6 +1084,7 @@ mod tests {
             disabled_builtin_skill_ids: Some(Vec::new()),
             mcp_ids: Some(vec!["mcp-a".to_owned()]),
             workspace: Some("D:/workspace".to_owned()),
+            claude_account_id: None,
         });
         assert!(validate_request(&valid).is_ok());
     }
@@ -1111,6 +1121,7 @@ mod tests {
             disabled_builtin_skill_ids: None,
             mcp_ids: None,
             workspace: Some("D:/workspace".to_owned()),
+            claude_account_id: None,
         });
         valid.workspace_lease = Some(ExternalConversationDispatchWorkspaceLease {
             workspace_id: "fork2".to_owned(),
@@ -1139,6 +1150,7 @@ mod tests {
             disabled_builtin_skill_ids: Some(Vec::new()),
             mcp_ids: Some(vec!["mcp-a".to_owned()]),
             workspace: Some("D:/workspace".to_owned()),
+            claude_account_id: None,
         };
         let request = create_conversation_request(&options);
         let assistant = request.assistant.unwrap();
@@ -1148,6 +1160,25 @@ mod tests {
             Some("gpt-5.6-sol")
         );
         assert_eq!(request.extra["workspace"], "D:/workspace");
+        assert!(request.extra.get("claude_account_id").is_none());
+    }
+
+    #[test]
+    fn create_request_carries_selected_claude_account() {
+        let options = ExternalConversationDispatchCreateOptions {
+            agent_id: "agent-claude".to_owned(),
+            title: None,
+            model_id: None,
+            mode: None,
+            thought_level: None,
+            enabled_skill_ids: None,
+            disabled_builtin_skill_ids: None,
+            mcp_ids: None,
+            workspace: None,
+            claude_account_id: Some(" max ".to_owned()),
+        };
+        let request = create_conversation_request(&options);
+        assert_eq!(request.extra["claude_account_id"], "max");
     }
 
     #[test]

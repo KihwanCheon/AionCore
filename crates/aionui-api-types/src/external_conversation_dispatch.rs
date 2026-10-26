@@ -27,6 +27,9 @@ pub struct ExternalConversationDispatchCreateOptions {
     pub mcp_ids: Option<Vec<String>>,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Non-default Claude account for the new conversation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account_id: Option<String>,
 }
 
 /// Workspace lease assigned by an external orchestrator when an existing

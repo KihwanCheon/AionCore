@@ -3870,6 +3870,7 @@ mod tests {
             last_failure_at: None,
             has_command_override: false,
             env_override_key_count: 0,
+            claude_accounts: None,
         }
     }
 

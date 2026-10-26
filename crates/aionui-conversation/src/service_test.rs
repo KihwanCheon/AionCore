@@ -10075,6 +10075,50 @@ async fn update_allows_other_extra_fields() {
 }
 
 #[tokio::test]
+async fn claude_account_is_kept_at_create_and_immutable_on_update() {
+    let (svc, _broadcaster, _repo, task_mgr) = make_service();
+    let workspace = ensure_test_workspace_path();
+
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "claude", "claude_account_id": "max" },
+    }))
+    .unwrap();
+    let resp = svc.create("u", req).await.unwrap();
+    assert_eq!(resp.extra["claude_account_id"], "max");
+
+    // Clients that echo the whole extra back must not be blocked.
+    let same: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "claude_account_id": "max", "display_density": "compact" },
+    }))
+    .unwrap();
+    let updated = svc.update("u", &resp.id, same, &task_mgr).await.unwrap();
+    assert_eq!(updated.extra["claude_account_id"], "max");
+
+    let switch: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "claude_account_id": "default" },
+    }))
+    .unwrap();
+    match svc.update("u", &resp.id, switch, &task_mgr).await.unwrap_err() {
+        ConversationError::BadRequest { reason } => assert!(reason.contains("claude_account_id"), "{reason}"),
+        other => panic!("expected BadRequest, got {other:?}"),
+    }
+
+    let plain: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "backend": "claude" },
+    }))
+    .unwrap();
+    let plain = svc.create("u", plain).await.unwrap();
+    assert!(plain.extra.get("claude_account_id").is_none());
+    let attach: UpdateConversationRequest = serde_json::from_value(json!({
+        "extra": { "claude_account_id": "max" },
+    }))
+    .unwrap();
+    assert!(svc.update("u", &plain.id, attach, &task_mgr).await.is_err());
+}
+
+#[tokio::test]
 async fn get_backfills_legacy_row_and_persists() {
     let resolver = Arc::new(FixedSkillResolver {
         names: vec!["cron".into(), "todo-tracker".into()],

@@ -277,7 +277,12 @@ impl AppServices {
 
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
-        let fork_integrations = build_fork_integration_services(conversation_repo.clone(), mcp_server_repo.clone())?;
+        let fork_integrations = build_fork_integration_services(
+            conversation_repo.clone(),
+            mcp_server_repo.clone(),
+            database.pool().clone(),
+            &data_dir,
+        )?;
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
 
         // Project-bind service (side branch). temp_root mirrors the existing

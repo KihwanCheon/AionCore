@@ -2372,6 +2372,21 @@ impl ConversationService {
             });
         }
 
+        // Fork: the Claude account is fixed at creation. Session transcripts live in
+        // that account's config directory, so switching it would silently drop the
+        // backend context on the next resume.
+        if let Some(incoming) = req.extra.as_ref().and_then(|extra| extra.get("claude_account_id"))
+            && serde_json::from_str::<serde_json::Value>(&existing.extra)
+                .ok()
+                .and_then(|current| current.get("claude_account_id").cloned())
+                .as_ref()
+                != Some(incoming)
+        {
+            return Err(ConversationError::BadRequest {
+                reason: "extra.claude_account_id is immutable post-creation".into(),
+            });
+        }
+
         // Antigravity keeps its runtime mode/model in the same `acp_session`
         // snapshot ACP does, so `extra` is just as much a second source of
         // truth here — a client PATCH that set them would diverge from the

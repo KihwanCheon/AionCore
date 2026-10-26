@@ -99,6 +99,9 @@ pub struct AcpBuildExtra {
     /// the first session open when no backend session id is bound yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork: Option<ForkSpec>,
+    /// Fork: non-default Claude account chosen at creation (see `claude_account`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_account_id: Option<String>,
 }
 
 /// Aionrs-specific fields extracted from `extra` in build task options.

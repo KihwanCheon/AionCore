@@ -330,6 +330,9 @@ pub struct AgentManagementRow {
     pub has_command_override: bool,
     #[serde(default)]
     pub env_override_key_count: usize,
+    /// Fork: Claude accounts in shared order; set on Claude rows only when two or more exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude_accounts: Option<Vec<crate::ClaudeAccountSummary>>,
 }
 
 #[cfg(test)]

@@ -7,6 +7,7 @@ pub mod agent_task;
 pub mod antigravity_hook;
 pub mod capability;
 pub mod cc_switch;
+pub mod claude_accounts;
 mod claude_flags;
 pub(crate) mod cli_probe;
 pub(crate) mod dev_prompt_dump;
