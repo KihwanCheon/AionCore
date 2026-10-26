@@ -1337,7 +1337,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("zzz_real_dir")).unwrap();
         fs::write(dir.path().join("aaa_file.txt"), "x").unwrap();
-        let target = dir.path().join("target_dir");
+        // The link target lives outside the listed directory so the listing
+        // holds exactly the link, the real directory and the file.
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("target_dir");
         fs::create_dir(&target).unwrap();
         std::os::unix::fs::symlink(&target, dir.path().join("bbb_link_dir")).unwrap();
 
